@@ -18,26 +18,43 @@
 #include "bitcoin.h"
 #include "stratifier.h"
 
-static bool check_required_rule(const char maybe_unused__ * rule)
+static const char *understood_rules[] = {"segwit", "csv", "taproot", "mweb"};
+
+static bool check_required_rule(const char *rule)
 {
+    unsigned int i;
+
+    if (!rule)
+        return false;
+    for (i = 0; i < sizeof(understood_rules) / sizeof(understood_rules[0]); i++) {
+        if (safecmp(understood_rules[i], rule) == 0)
+            return true;
+    }
     return false;
 }
 
 /* Take a bitcoin address and do some sanity checks on it, then send it to
- * bitcoind to see if it's a valid address */
+ * bitcoind to see if it's a valid address (supports Legacy P2PKH, P2SH,
+ * Native SegWit P2WPKH/P2WSH, and Taproot P2TR). */
 bool validate_address(connsock_t *cs, const char *address, bool *is_p2sh, void *cscript_out, int *cscript_len)
 {
     json_t *val, *res_val, *valid_val, *tmp_val;
     char rpc_req[256];
     bool ret = false;
     const char *spk = NULL;
+    size_t addr_len;
 
     if (unlikely(!address)) {
         LOGWARNING("Null address passed to validate_address");
         return ret;
     }
+    addr_len = strlen(address);
+    if (unlikely(!addr_len || addr_len > 128 || strpbrk(address, "\"\\\r\n\t "))) {
+        LOGDEBUG("Invalid characters or length in address: %s", address);
+        return ret;
+    }
 
-    snprintf(rpc_req, 256, "{\"method\": \"validateaddress\", \"params\": [\"%s\"]}\n", address);
+    snprintf(rpc_req, sizeof(rpc_req), "{\"method\": \"validateaddress\", \"params\": [\"%s\"]}\n", address);
     val = json_rpc_response(cs, rpc_req);
     if (!val) {
         /* May get a parse error with an invalid address */
@@ -66,48 +83,42 @@ bool validate_address(connsock_t *cs, const char *address, bool *is_p2sh, void *
         }
         tmp_val = json_object_get(res_val, "scriptPubKey");
         if (unlikely(!tmp_val || !(spk = json_string_value(tmp_val)))) {
-            /* All recent bitcoinds with wallet support built in should
-             * support this, if not, quit here to keep things simple. */
-            quit(1, "No scriptPubkey returned for address %s -- please use a bitcoind with wallet support.", address);
+            LOGERR("No scriptPubKey returned from bitcoind for address %s", address);
+            goto out;
         }
         const int len = strlen(spk);
         if (unlikely(!len || len % 2)) {
-            LOGERR("Bad scriptPubkey (not hex?) returned from bitcoind: \"%s\"", spk);
+            LOGERR("Bad scriptPubKey (not hex?) returned from bitcoind: \"%s\"", spk);
             goto out;
         }
-        if (unlikely(len/2 > *cscript_len)) {
-            LOGERR("Not enough space for scriptPubkey in output buffer: %d bytes required but only %d bytes specified.",
-                   len/2, *cscript_len);
+        if (unlikely(len / 2 > *cscript_len)) {
+            LOGERR("Not enough space for scriptPubKey in output buffer: %d bytes required but only %d bytes specified.",
+                   len / 2, *cscript_len);
             goto out;
         }
-        *cscript_len = len/2;
+        *cscript_len = len / 2;
         if (unlikely(!hex2bin(cscript_out, spk, *cscript_len))) {
-            LOGERR("scriptPubkey failed to parse as hex: %s", spk);
+            LOGERR("scriptPubKey failed to parse as hex: %s", spk);
             goto out;
         }
     }
     ret = true;
     if (is_p2sh) {
         tmp_val = json_object_get(res_val, "isscript");
-        if (unlikely(!tmp_val)) {
-            /* All recent bitcoinds with wallet support built in should
-             * support this, if not, quit here to keep things simple. */
-            quit(1, "No isscript support from bitcoind -- please use a bitcoind with wallet support.");
-        }
-        *is_p2sh = json_is_true(tmp_val);
+        *is_p2sh = tmp_val ? json_is_true(tmp_val) : false;
     }
     if (spk)
-        LOGDEBUG("Bitcoin address %s IS valid%s with scriptPubkey %s (%d bytes)", address,
-                 is_p2sh && *is_p2sh ? " (p2sh)" : "", spk, cscript_len ? *cscript_len : 0);
+        LOGDEBUG("Bitcoin address %s IS valid%s with scriptPubKey %s (%d bytes)", address,
+                 is_p2sh && *is_p2sh ? " (script)" : "", spk, cscript_len ? *cscript_len : 0);
     else
-        LOGDEBUG("Bitcoin address %s IS valid%s", address, is_p2sh && *is_p2sh ? " (p2sh)" : "");
+        LOGDEBUG("Bitcoin address %s IS valid%s", address, is_p2sh && *is_p2sh ? " (script)" : "");
 out:
     if (val)
         json_decref(val);
     return ret;
 }
 
-static const char *gbt_req = "{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": [\"coinbasetxn\", \"workid\", \"coinbase/append\"], \"rules\" : []}]}\n";
+static const char *gbt_req = "{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": [\"coinbasetxn\", \"workid\", \"coinbase/append\"], \"rules\" : [\"segwit\"]}]}\n";
 
 /* Request getblocktemplate from bitcoind already connected with a connsock_t
  * and then summarise the information to the most efficient set of data
@@ -141,7 +152,7 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 
     rules_array = json_object_get(res_val, "rules");
     if (rules_array) {
-        int rule_count =  json_array_size(rules_array);
+        int rule_count = json_array_size(rules_array);
 
         for (i = 0; i < rule_count; i++) {
             rule = json_string_value(json_array_get(rules_array, i));
@@ -155,11 +166,13 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
     previousblockhash = json_string_value(json_object_get(res_val, "previousblockhash"));
     target = json_string_value(json_object_get(res_val, "target"));
     version = json_integer_value(json_object_get(res_val, "version"));
+    /* Clear bit 23 (0x00800000) for DigiByte hardfork compatibility and BIP320 version-rolling */
+    version &= ~0x00800000;
     curtime = json_integer_value(json_object_get(res_val, "curtime"));
     bits = json_string_value(json_object_get(res_val, "bits"));
     height = json_integer_value(json_object_get(res_val, "height"));
     coinbasevalue = json_integer_value(json_object_get(res_val, "coinbasevalue"));
-    if ((coinbase_aux = json_object_get(res_val, "coinbaseaux"))) // optional key; doesn't exist on Flowee (issue #12)
+    if ((coinbase_aux = json_object_get(res_val, "coinbaseaux")))
         flags = json_string_value(json_object_get(coinbase_aux, "flags"));
     if (!flags)
         flags = "";
