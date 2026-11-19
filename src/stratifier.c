@@ -46,14 +46,14 @@
 static const char *workpadding = "000000800000000000000000000000000000000000000000000000000000000000000000000000000000000080020000";
 static const char *scriptsig_header = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff";
 static uchar scriptsig_header_bin[41];
-#define MAX_COINBASE_TX_LEN 1000000 /* =1MB Maximum size of a coinbase tx in bytes, total. BCH consensus rule. */
-#define MAX_COINBASE_SCRIPTSIG_LEN 100 /* BCH consensus rule -- scriptsig cannot exceed 100 bytes */
+#define MAX_COINBASE_TX_LEN 100000 /* 100KB Maximum size of a coinbase tx in bytes for BTC/DGB */
+#define MAX_COINBASE_SCRIPTSIG_LEN 100 /* Consensus rule -- scriptsig cannot exceed 100 bytes */
 #define TX_RESERVE_SIZE (41 + 1 + MAX_COINBASE_SCRIPTSIG_LEN + 4 + 1 + 2 + 4)
 #define MAX_CB_SPACE (MAX_COINBASE_TX_LEN - TX_RESERVE_SIZE)
 static const double nonces = 4294967296;
 
 #define HERP_N		5 /* 5 * network diff SPLNS */
-#define CBGENLEN	34 /* Maximum extra space required per user in coinbase */
+#define CBGENLEN	43 /* Maximum extra space required per user in coinbase (8B amt + 1B len + 34B P2TR/P2WSH) */
 #define DERP_DUST	5460 /* Minimum DERP to get onto payout list */
 #define PAYOUT_DUST	DUST_LIMIT_SATS /* Minimum payout not dust -- currently 546 sats */
 #define DERP_SPACE	1000 /* Minimum derp to warrant leaving coinbase space */
@@ -1055,17 +1055,31 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
     strbuffer_append_bytes(strbuf, scriptsig_header_bin, 41); // fixed header length
     strbuffer_append_byte(strbuf, 0); // Script length is filled in at the end @ buffer position [41]
 
-    /* Put block height at start of scriptsig (consensus rule) */
+    /* Put block height at start of scriptsig (BIP34 consensus rule) */
     {
         uint8_t buf[16];
         len = ser_cbheight(buf, wb->height);
         strbuffer_append_bytes(strbuf, buf, len);
     }
 
+    /* Append optional coinbaseaux flags from bitcoind if space permits */
+    if (wb->flags && *wb->flags) {
+        const int cur_len = (int)strbuf->length - 41 - 1;
+        const int space_left = MAX_COINBASE_SCRIPTSIG_LEN - cur_len;
+        int flen = (int)strlen(wb->flags) / 2;
+        if (flen > 0 && flen + 1 <= space_left) {
+            uint8_t fbuf[100];
+            if (hex2bin(fbuf, wb->flags, flen)) {
+                strbuffer_append_byte(strbuf, (uint8_t)flen);
+                strbuffer_append_bytes(strbuf, fbuf, flen);
+            }
+        }
+    }
+
     len = strbuf->length - 41 - 1; // account for the header and scriptsig length byte.
     {
         // ensure that what follows is <=100 bytes total for the scriptsig otherwise
-        // block will be rejected as per BCH consensus rules.
+        // block will be rejected as per consensus rules.
         const int spaceLeft = MAX_COINBASE_SCRIPTSIG_LEN - len;
         if (ckp->n_bchsigs > 0) {
             // pick a random coinbase text from the array of sigs defined in conf "bchsig"
@@ -1082,21 +1096,24 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
     }
 
     len = strbuf->length - 41 - 1; // again, account for the header and scriptsig length byte.
+    /* Bitcoin consensus requires coinbase scriptSig to be at least 2 bytes (bad-cb-length) */
+    if (unlikely(len < 2)) {
+        strbuffer_append_byte(strbuf, 0x00);
+        len = strbuf->length - 41 - 1;
+    }
+
     /* Set the scriptsig length now - always 1 byte of data (length is always <=100) */
     strbuf->uvalue[41] = (uint8_t)len;
 
-    if (unlikely(len > MAX_COINBASE_SCRIPTSIG_LEN || len <= 0)) {
-        // Paranoia: This should never happen. But if it does, we need to quit ASAP since mining will break.
-        // Taking this branch indicates a bug in the code above.
-        quit(1, "INTERNAL ERROR: Max coinbase scriptsig length is %d, but we generated a scriptsig of "
-             "%d bytes.  File: %s, line: %d", (int)MAX_COINBASE_SCRIPTSIG_LEN, (int)(wb->coinb1bin[41]),
-             __FILE__, (int)__LINE__);
+    if (unlikely(len > MAX_COINBASE_SCRIPTSIG_LEN || len < 2)) {
+        quit(1, "INTERNAL ERROR: Invalid coinbase scriptsig length %d (must be 2..%d). File: %s, line: %d",
+             len, (int)MAX_COINBASE_SCRIPTSIG_LEN, __FILE__, (int)__LINE__);
     }
     // after scriptsig, put sequence
     strbuffer_append_bytes(strbuf, "\xff\xff\xff\xff", 4);
 
     // at this point strbuf (and cb1_buf) points to the tx.vout length field (compact size).
-    // reserve 3 bytes for this field.  Common case is we will have to move the data back by 2 bytes, however.
+    // reserve 3 bytes for this field. Common case is we will have to move the data back by 2 bytes, however.
     const int compact_size_pos = strbuf->length;
 #define compact_size_reserved 3
     {
@@ -1108,8 +1125,24 @@ static void generate_coinbase(const pool_t *ckp, workbase_t *wb)
 
     /* Add all the payout outputs (including pool fees and donations, if any, etc).
        In the rare case of leftover satoshis, they are guaranteed to go back to the pool
-       as a fallback.  The below call always succeeds if it returns. */
+       as a fallback. The below call always succeeds if it returns. */
     const uint64_t solo_amount = add_coinbase_payouts(ckp, wb, &cb1_buf);
+
+    /* BIP141 SegWit: Add default_witness_commitment output (0 value, >=38-byte scriptPubKey) if present */
+    if (wb->json) {
+        const char *wcomm = json_string_value(json_object_get(wb->json, "default_witness_commitment"));
+        if (wcomm) {
+            const size_t whexlen = strlen(wcomm);
+            if (likely(whexlen >= 76 && (whexlen % 2) == 0 && (whexlen / 2) < 253)) {
+                uint8_t wbin[256];
+                const size_t wbinlen = whexlen / 2;
+                if (likely(hex2bin(wbin, wcomm, wbinlen))) {
+                    add_output_(&cb1_buf, 0, wbin, wbinlen);
+                    LOGDEBUG("Added SegWit default_witness_commitment (%zu bytes) to coinbase", wbinlen);
+                }
+            }
+        }
+    }
 
     if (ckp->solo) {
         // SOLO mode, leave room for 1 output for the solo miner. This output goes at the end of cb2
@@ -2819,16 +2852,6 @@ static double share_diff(const stratum_instance_t *client /* may be NULL */,
         *cblen += wb->coinb2len;
     }
 
-#if 0
-    // DEBUGGING
-    if (SHOULD_EVALUATE_LOGMSG(LOG_DEBUG)) {
-        char *hex = bin2hex(coinbase, *cblen);
-        LOGDEBUG("%s:%d: Got coinbase of length %d from client %lld, raw coinbase hex is: %s",
-                 __FILE__, __LINE__, *cblen, client ? (long long)client->id : 0ll, hex);
-        free(hex);
-    }
-#endif
-
     gen_hash((const uchar *)coinbase, merkle_root, *cblen);
     memcpy(merkle_sha, merkle_root, 32);
     for (i = 0; i < wb->merkles && i < GENWORK_MAX_MERKLE_DEPTH; ++i) {
@@ -2842,10 +2865,12 @@ static double share_diff(const stratum_instance_t *client /* may be NULL */,
     memcpy(data, wb->headerbin, 80);
     memcpy(data + 36, merkle_root, 32);
 
-    /* Update nVersion when version_mask is in use */
+    /* Update nVersion when version_mask is in use (BIP310: clear mask bits first, then OR rolled bits) */
     if (version_mask) {
+        const uint32_t pool_mask = (wb->ckp && wb->ckp->version_mask) ? wb->ckp->version_mask : 0x1fffe000U;
+        const uint32_t mask_be = htobe32(pool_mask);
         version_mask = htobe32(version_mask);
-        write_i32(data, version_mask | read_i32(data)) ;
+        write_i32(data, (read_i32(data) & ~mask_be) | (version_mask & mask_be));
     }
 
     /* Insert the nonce value into the data */
@@ -2942,24 +2967,39 @@ static void send_node_block(pool_t *ckp, sdata_t *sdata, const char *enonce1, co
 }
 
 /* Process a block into a message for the generator to submit. Must hold
- * workbase readcount */
+ * workbase readcount. In SegWit blocks (BIP141/BIP144), the coinbase
+ * transaction hashed by miners for the header merkle_root is in stripped
+ * (non-witness) format, while submitblock requires the coinbase transaction
+ * to include the SegWit marker (0x00), flag (0x01), and the 32-byte witness
+ * reserved value (0x01 0x20 0x00..00) before nLockTime. */
 static char *
 process_block(const workbase_t *wb, const char *coinbase, const int cblen,
           const uchar *data, const uchar *hash, uchar *flip32, char *blockhash,
           size_t *gbt_block_len)
 {
+    static const char * const cb_witness_hex =
+        "01200000000000000000000000000000000000000000000000000000000000000000";
+    static const uint8_t witness_magic[6] = {0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed};
     char *gbt_block;
     int txns = wb->txns + 1;
     size_t gbt_block_offset = 0;
+    bool has_witness = false;
 
     flip_32(flip32, hash);
     bin2hex__(blockhash, flip32, 32);
 
-    /* Message format: "data" */
+    /* Detect if coinbase carries a BIP141 witness commitment */
+    if (wb->json && json_object_get(wb->json, "default_witness_commitment"))
+        has_witness = true;
+    else if (cblen >= 47 && memmem(coinbase, cblen, witness_magic, sizeof(witness_magic)) != NULL)
+        has_witness = true;
+
+    /* Message format: "data" (+72 hex chars reserved for SegWit marker/flag and witness stack) */
     gbt_block = ckzalloc(
-        160              + /* data */
+        160              + /* 80-byte block header hex */
         10               + /* max varint */
-        (cblen * 2)      + /* cb */
+        (cblen * 2)      + /* coinbase hex */
+        72               + /* SegWit marker/flag (4) + 34-byte witness stack (68) */
         wb->txn_data_len + /* tx data */
         1                  /* zero termination */
         );
@@ -2978,7 +3018,22 @@ process_block(const workbase_t *wb, const char *coinbase, const int cblen,
         gbt_block_offset += bin2hex__(gbt_block + gbt_block_offset, (const unsigned char *)&val32, 4);
     }
 
-    gbt_block_offset += bin2hex__(gbt_block + gbt_block_offset, coinbase, cblen);
+    if (likely(has_witness && cblen >= 12)) {
+        /* 1. nVersion (4 bytes) */
+        gbt_block_offset += bin2hex__(gbt_block + gbt_block_offset, (const uchar *)coinbase, 4);
+        /* 2. SegWit marker (0x00) and flag (0x01) */
+        memcpy(gbt_block + gbt_block_offset, "0001", 4);
+        gbt_block_offset += 4;
+        /* 3. Transaction inputs (vin) and outputs (vout) */
+        gbt_block_offset += bin2hex__(gbt_block + gbt_block_offset, (const uchar *)coinbase + 4, cblen - 8);
+        /* 4. Witness reserved value stack: 1 item of 32 zero bytes */
+        memcpy(gbt_block + gbt_block_offset, cb_witness_hex, 68);
+        gbt_block_offset += 68;
+        /* 5. nLockTime (last 4 bytes) */
+        gbt_block_offset += bin2hex__(gbt_block + gbt_block_offset, (const uchar *)coinbase + cblen - 4, 4);
+    } else {
+        gbt_block_offset += bin2hex__(gbt_block + gbt_block_offset, (const uchar *)coinbase, cblen);
+    }
 
     if (likely(wb->txns))
         strcpy(gbt_block + gbt_block_offset, wb->txn_data);
@@ -10469,6 +10524,7 @@ static void update_node_status_file(pool_t *ckp)
 {
     json_t *minfo = rpc_call_node(ckp, "getmininginfo");
     json_t *netinfo = rpc_call_node(ckp, "getnetworkinfo");
+    sdata_t *sdata = ckp->sdata;
 
     double net_hashrate = 0.0;
     double net_diff = 0.0;
@@ -10484,11 +10540,30 @@ static void update_node_status_file(pool_t *ckp)
             net_hashrate = json_number_value(j_hr);
 
         json_t *j_diff = json_object_get(minfo, "difficulty");
-        if (j_diff && json_is_number(j_diff))
+        if (j_diff && json_is_number(j_diff)) {
             net_diff = json_number_value(j_diff);
+        } else if (j_diff && json_is_object(j_diff)) {
+            json_t *j_sha = json_object_get(j_diff, "sha256d");
+            if (j_sha && json_is_number(j_sha))
+                net_diff = json_number_value(j_sha);
+        }
+        if (net_diff <= 0.0) {
+            json_t *j_diffs = json_object_get(minfo, "difficulties");
+            if (j_diffs && json_is_object(j_diffs)) {
+                json_t *j_sha = json_object_get(j_diffs, "sha256d");
+                if (j_sha && json_is_number(j_sha))
+                    net_diff = json_number_value(j_sha);
+            }
+        }
 
         json_get_int(&cur_height, minfo, "blocks");
         json_get_int(&mempool_tx, minfo, "pooledtx");
+    }
+    if (net_diff <= 0.0 && sdata) {
+        ck_rlock(&sdata->workbase_lock);
+        if (sdata->current_workbase)
+            net_diff = sdata->current_workbase->network_diff;
+        ck_runlock(&sdata->workbase_lock);
     }
     if (netinfo) {
         const char *sv = json_string_value(json_object_get(netinfo, "subversion"));
@@ -11350,24 +11425,25 @@ void normalize_bchsig(char *s, int *len)
 static bool get_chain_and_prefix(pool_t *ckp)
 {
     const size_t len = sizeof(ckp->cashaddr_prefix);
-    assert(len > strlen(CASHADDR_PREFIX_MAIN));
-    if (! generator_get_chain(ckp, ckp->chain))
+    if (!generator_get_chain(ckp, ckp->chain))
         return false;
-    if (!strcmp(ckp->chain, "test")) { // testnet
-        strncpy(ckp->cashaddr_prefix, CASHADDR_PREFIX_TEST, len);
-        ckp->not_mainnet = true;
-    } else if (!strcmp(ckp->chain, "regtest")) { // regtest
-        strncpy(ckp->cashaddr_prefix, CASHADDR_PREFIX_REGTEST, len);
+
+    if (!strcmp(ckp->chain, "main")) {
+        strncpy(ckp->cashaddr_prefix, "bc", len);
+        ckp->not_mainnet = false;
+    } else if (!strcmp(ckp->chain, "regtest")) {
+        strncpy(ckp->cashaddr_prefix, "bcrt", len);
         ckp->not_mainnet = true;
     } else {
-        // default to mainnet
-        strncpy(ckp->cashaddr_prefix, CASHADDR_PREFIX_MAIN, len);
-        ckp->not_mainnet = false;
+        /* Covers "test", "testnet4", "signet", and DGB testnets */
+        strncpy(ckp->cashaddr_prefix, "tb", len);
+        ckp->not_mainnet = true;
     }
     if (likely(len))
-        ckp->cashaddr_prefix[len-1] = 0; // ensure NUL termination
+        ckp->cashaddr_prefix[len - 1] = 0;
 
-    LOGINFO("chain: \"%s\" cashaddr prefix: \"%s\"", ckp->chain, ckp->cashaddr_prefix);
+    LOGINFO("chain: \"%s\" prefix: \"%s\" (mainnet: %s)",
+            ckp->chain, ckp->cashaddr_prefix, ckp->not_mainnet ? "no" : "yes");
     return true;
 }
 
@@ -11405,7 +11481,7 @@ void *stratifier(void *arg)
         hex2bin(scriptsig_header_bin, scriptsig_header, 41);
 
         if (!(sdata->scriptlen = generator_checkaddr(ckp, ckp->bchaddress, sdata->scriptbin))) {
-            LOGEMERG("Fatal: bchaddress \"%s\" invalid according to bitcoind", ckp->bchaddress);
+            LOGEMERG("Fatal: pool payout address \"%s\" invalid according to bitcoind", ckp->bchaddress);
             goto out;
         }
         if (ckp->single_payout_override) {
@@ -11416,22 +11492,11 @@ void *stratifier(void *arg)
             }
         }
 
-        if (!ckp->disable_dev_donation) {
-            for (int i = 0; i < DONATION_NUM_ADDRESSES; ++i) {
-                __typeof__(*ckp->dev_donations) *don = ckp->dev_donations + i;
-                __typeof__(*sdata->donation_data) *dd = sdata->donation_data + i;
-                dd->scriptlen = generator_checkaddr(ckp, don->address, dd->scriptbin);
-                if (dd->scriptlen) {
-                    don->valid = true;
-                    sdata->n_good_donation++;
-                }
-            }
-        } else {
-            for (int i = 0; i < DONATION_NUM_ADDRESSES; ++i)
-                ckp->dev_donations[i].valid = false; // ensure cleared
-            sdata->n_good_donation = 0; // ensure cleared
-            LOGINFO("Dev donations disabled due to conf file setting \"disable_dev_donation\"");
-        }
+        /* Always disable legacy hardcoded BCH dev donation addresses on BTC/DGB fork */
+        ckp->disable_dev_donation = true;
+        for (int i = 0; i < DONATION_NUM_ADDRESSES; ++i)
+            ckp->dev_donations[i].valid = false;
+        sdata->n_good_donation = 0;
     }
 
     randomiser = time(NULL);
@@ -11458,7 +11523,7 @@ void *stratifier(void *arg)
     read_poolstats(ckp, &tvsec_diff);
     read_userstats(ckp, sdata, tvsec_diff);
     read_unconfirmed_blocks(ckp, sdata); /* Restore unconfirmed blocks from the disk */
-    
+
     /* Create the logs/history/ folder structure when starting the pool. */
     ensure_history_dirs(ckp->logdir);
 
