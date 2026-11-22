@@ -721,6 +721,84 @@ static size_t add_output_(cb1_buffer_t *buf, uint64_t amount, const void *script
     return ret;
 }
 
+typedef struct {
+    char *key;
+    double val;
+} payout_sort_item_t;
+
+static int payout_sort_desc(const void *a, const void *b)
+{
+    const payout_sort_item_t *pa = (const payout_sort_item_t *)a;
+    const payout_sort_item_t *pb = (const payout_sort_item_t *)b;
+    if (pb->val > pa->val)
+        return 1;
+    if (pb->val < pa->val)
+        return -1;
+    return strcmp(pa->key, pb->key);
+}
+
+/* Safely add or accumulate a payout amount (rounded to exact satoshis) */
+static void payout_add_amount(json_t *payouts, const char *addr, double amount)
+{
+    double existing = 0.0;
+
+    if (!payouts || !addr || !*addr || amount <= 0.0)
+        return;
+    if (json_get_double(&existing, payouts, addr))
+        amount = round((existing + amount) * (double)SATOSHIS) / (double)SATOSHIS;
+    json_set_double(payouts, addr, amount);
+}
+
+/* Re-order JSON object keys in descending order by payout value */
+static void sort_payouts_descending(json_t *payouts)
+{
+    size_t count, i = 0;
+    const char *key;
+    json_t *val;
+
+    if (!payouts)
+        return;
+    count = json_object_size(payouts);
+    if (count <= 1)
+        return;
+
+    payout_sort_item_t *items = ckalloc(count * sizeof(*items));
+    json_object_foreach(payouts, key, val) {
+        if (i >= count)
+            break;
+        items[i].key = strdup(key);
+        items[i].val = json_number_value(val);
+        i++;
+    }
+
+    qsort(items, i, sizeof(*items), payout_sort_desc);
+    json_object_clear(payouts);
+
+    for (size_t j = 0; j < i; j++) {
+        json_set_double(payouts, items[j].key, items[j].val);
+        free(items[j].key);
+    }
+    free(items);
+}
+
+/* Replace <solominer> placeholder with the actual winning wallet while preserving
+ * pool fee / dev donation wallets, descending sort order, and exact cb_wallets count. */
+static void replace_solominer_payout(json_t *blockval, const char *winner)
+{
+    json_t *payouts = json_object_get(blockval, "payouts");
+    double solo_val = 0.0;
+
+    if (!payouts || !winner || !*winner)
+        return;
+    if (!json_get_double(&solo_val, payouts, "<solominer>"))
+        return;
+
+    json_object_del(payouts, "<solominer>");
+    payout_add_amount(payouts, winner, solo_val);
+    sort_payouts_descending(payouts);
+    json_set_int(blockval, "cb_wallets", (int)json_object_size(payouts));
+}
+
 /* Add generation transactions to the coinbase buffer `cb_buf` for each user, return any spare
  * change. Note that the return value may be negative if users had fee discounts,
  * in which case there is "negative" change and the pool output must deduct this amount
@@ -730,6 +808,7 @@ static size_t add_output_(cb1_buffer_t *buf, uint64_t amount, const void *script
  * (or add the positive return value which will always be >=546 sats).*/
 static int64_t add_user_generation(sdata_t *sdata, workbase_t *wb, cb1_buffer_t *cb_buf, uint64_t g64, uint64_t pf64)
 {
+    pool_t * const ckp = sdata->ckp;
     json_t * const payout = json_object(),
            * const payout_entries = json_object(),
            * postponed_entries = NULL;
@@ -754,9 +833,10 @@ static int64_t add_user_generation(sdata_t *sdata, workbase_t *wb, cb1_buffer_t 
 
     json_set_int(payout, "height", wb->height);
     json_set_double(payout, "reward", wb->coinbasevalue / (double)SATOSHIS);
-    /* Will be overwritten, just looks nicer in this position */
+    /* Will be overwritten in add_coinbase_payouts, placed here to preserve exact key order */
     json_set_double(payout, "fee", 0.);
     json_set_double(payout, "net_fee", 0.);
+    json_set_int(payout, "cb_wallets", 0);
     json_set_double(payout, "dev_donation", 0.);
     json_object_set_new_nocheck(payout, "payouts", payout_entries);
     json_set_double(payout, "herp", total_herp);
@@ -765,10 +845,11 @@ static int64_t add_user_generation(sdata_t *sdata, workbase_t *wb, cb1_buffer_t 
     json_set_int64(payout, "time", (int64_t)time(NULL));
 
     if (sdata->single_payout_override_scriptlen > 0) {
-        // single payout override mode -- just add g64 (total) as a single output and skip the json generation
-        // and the per-user payouts altogether
+        // single payout override mode -- just add g64 (total) as a single output and record in payouts
         if (g64 >= DUST_LIMIT_SATS) {
             amt_pos = add_output_(cb_buf, g64, sdata->single_payout_override_scriptbin, sdata->single_payout_override_scriptlen);
+            if (ckp && ckp->single_payout_override)
+                payout_add_amount(payout_entries, ckp->single_payout_override, g64 / (double)SATOSHIS);
             total = 0;
         }
         LOGDEBUG("Single payout override: entire reward of %"PRId64" will go to the override address", g64);
@@ -857,9 +938,9 @@ static int64_t add_user_generation(sdata_t *sdata, workbase_t *wb, cb1_buffer_t 
         const char * const username = max_payee.user->username;
         LOGDEBUG("Added %"PRId64" sats in dust to most-hash-payee: %s", total, username);
         uint64_t newreward = max_payee.reward + total;
-        newreward = htole64(newreward);
+        uint64_t le_newreward = htole64(newreward);
         // update coinbase binary, avoiding unaligned access issues by doing a byte copy
-        memcpy(cb_buf->buffer.value + max_payee.amt_pos, &newreward, sizeof(newreward));
+        memcpy(cb_buf->buffer.value + max_payee.amt_pos, &le_newreward, sizeof(le_newreward));
         total = 0;
         json_set_double(payout_entries, username, newreward / (double)SATOSHIS); // update json
     }
@@ -881,6 +962,7 @@ skip:
 static uint64_t add_coinbase_payouts(const pool_t *ckp, workbase_t *wb, cb1_buffer_t *cb1_buf)
 {
     uint64_t g64, f64, pf64, df64;
+    uint64_t dev_paid[DONATION_NUM_ADDRESSES] = {0};
     int64_t c64;
     sdata_t *sdata = ckp->sdata;
     size_t pool_amt_pos = 0;
@@ -922,6 +1004,7 @@ static uint64_t add_coinbase_payouts(const pool_t *ckp, workbase_t *wb, cb1_buff
                     if (sdata->donation_data[i].scriptlen && ckp->dev_donations[i].valid) {
                         // good address
                         add_output_(cb1_buf, don_each, sdata->donation_data[i].scriptbin, sdata->donation_data[i].scriptlen);
+                        dev_paid[i] = don_each;
                         leftover -= (int64_t)don_each;
                         const double d = don_each / (double)SATOSHIS;
                         LOGDEBUG("%f dev donation to address: %s", d, ckp->dev_donations[i].address);
@@ -957,16 +1040,26 @@ static uint64_t add_coinbase_payouts(const pool_t *ckp, workbase_t *wb, cb1_buff
         if (ckp->solo) {
             // SOLO mode: return early:
             //  - return generation amount that is leftover after taking fees
-            //  - set wb->payout with some sensible values which is needed later for writing to BLOCK.unconfirmed
+            //  - set wb->payout with exact coinbase wallet snapshot (including pool fee and dev donations)
             json_t *payout = json_object();
             const uint64_t solo_reward = g64 - f64;
             json_set_int(payout, "height", wb->height);
             json_set_double(payout, "reward", wb->coinbasevalue / (double)SATOSHIS);
             json_set_double(payout, "fee", f64 / (double)SATOSHIS);
             json_set_double(payout, "net_fee", pf64 / (double)SATOSHIS);
+            json_set_int(payout, "cb_wallets", 0);
             json_set_double(payout, "dev_donation", df64 / (double)SATOSHIS);
             json_t *payout_entries = json_object();
-            json_set_double(payout_entries, "<solominer>", solo_reward / (double)SATOSHIS); // fudge the payouts...
+            if (solo_reward >= DUST_LIMIT_SATS)
+                payout_add_amount(payout_entries, "<solominer>", solo_reward / (double)SATOSHIS);
+            if (pool_has_amt && pf64 >= DUST_LIMIT_SATS && ckp->bchaddress && *ckp->bchaddress)
+                payout_add_amount(payout_entries, ckp->bchaddress, pf64 / (double)SATOSHIS);
+            for (int i = 0; i < DONATION_NUM_ADDRESSES; ++i) {
+                if (dev_paid[i] > 0 && ckp->dev_donations[i].address && *ckp->dev_donations[i].address)
+                    payout_add_amount(payout_entries, ckp->dev_donations[i].address, dev_paid[i] / (double)SATOSHIS);
+            }
+            sort_payouts_descending(payout_entries);
+            json_set_int(payout, "cb_wallets", (int)json_object_size(payout_entries));
             json_object_set_new_nocheck(payout, "payouts", payout_entries);
             json_set_double(payout, "herp", sdata->stats.payout_herp);
             json_object_set_new_nocheck(payout, "postponed", json_object());
@@ -1017,7 +1110,18 @@ static uint64_t add_coinbase_payouts(const pool_t *ckp, workbase_t *wb, cb1_buff
         if (pool_has_amt && pf64 < DUST_LIMIT_SATS)
             LOGWARNING("%"PRId64" sats in pool fee is below dust limit (%d)! FIXME!", pf64, (int)DUST_LIMIT_SATS);
         if (wb->payout) {
-            // tabulate this as "pool fee" in json
+            // tabulate pool fee, dev donations, sorted payouts, and cb_wallets count in json
+            json_t *payout_entries = json_object_get(wb->payout, "payouts");
+            if (payout_entries) {
+                if (pool_has_amt && pf64 >= DUST_LIMIT_SATS && ckp->bchaddress && *ckp->bchaddress)
+                    payout_add_amount(payout_entries, ckp->bchaddress, pf64 / (double)SATOSHIS);
+                for (int i = 0; i < DONATION_NUM_ADDRESSES; ++i) {
+                    if (dev_paid[i] > 0 && ckp->dev_donations[i].address && *ckp->dev_donations[i].address)
+                        payout_add_amount(payout_entries, ckp->dev_donations[i].address, dev_paid[i] / (double)SATOSHIS);
+                }
+                sort_payouts_descending(payout_entries);
+                json_set_int(wb->payout, "cb_wallets", (int)json_object_size(payout_entries));
+            }
             json_set_double(wb->payout, "fee", f64 / (double)SATOSHIS);
             json_set_double(wb->payout, "net_fee", pf64 / (double)SATOSHIS);
             json_set_double(wb->payout, "dev_donation", df64 / (double)SATOSHIS);
@@ -2060,11 +2164,17 @@ static void confirm_block(sdata_t *sdata, json_t *blocksolve_val)
         LOGERR("Failed to get payouts object in confirm_block");
         return;
     }
-    /* Clear all accumulated herp from users paid out, lockless is fine for
-     * zeroing. */
+    /* Clear all accumulated herp from existing miner users paid out.
+     * Use HASH_FIND_STR instead of get_user() so pool fee / dev donation
+     * addresses included in payouts never spawn fake user_instance entries. */
     json_object_foreach(payouts, username, val) {
+        user = NULL;
+        ck_rlock(&sdata->instance_lock);
+        HASH_FIND_STR(sdata->user_instances, username, user);
+        ck_runlock(&sdata->instance_lock);
+        if (!user)
+            continue;
         LOGINFO("Resetting user %s accumulated and postponed", username);
-        user = get_user(sdata, username);
         user->accumulated = user->postponed = 0;
     }
 
@@ -2089,7 +2199,13 @@ static void confirm_block(sdata_t *sdata, json_t *blocksolve_val)
     json_object_foreach(postponed, username, val) {
         double herp, derp;
 
-        user = get_user(sdata, username);
+        user = NULL;
+        ck_rlock(&sdata->instance_lock);
+        HASH_FIND_STR(sdata->user_instances, username, user);
+        ck_runlock(&sdata->instance_lock);
+        if (!user)
+            continue;
+
         herp = json_real_value(val);
         LOGINFO("Setting %f accumulated herp to user %s", herp, username);
         derp = herp / rolling_herp * dreward;
@@ -7718,7 +7834,7 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
      * the delay of local verification */
     ret = local_block_submit(ckp, gbt_block, gbt_block_len, flip32, wb->height);
 
-    /* Calculate the latence in ms. */
+    /* Calculate the latency in ms. */
     const int64_t node_latency_ms = (time_micros() - t_submit_start) / 1000;
 
     if (ret) {
@@ -7732,17 +7848,8 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 
         blockval = json_deep_copy(wb->payout);
         json_set_string(blockval, "solvedby", client->workername ? client->workername : client->user_instance->username);
-        if (ckp->solo) {
-            json_t *payouts = json_object_get(blockval, "payouts");
-            if (payouts) {
-                double val;
-                if (json_get_double(&val, payouts, "<solominer>") && json_object_size(payouts) == 1
-                    && client && client->user_instance && client->user_instance->username[0]) {
-                    json_object_clear(payouts);
-                    json_set_double(payouts, client->user_instance->username, val);
-                }
-            }
-        }
+        if (ckp->solo && client && client->user_instance && client->user_instance->username[0])
+            replace_solominer_payout(blockval, client->user_instance->username);
 
         /* 1. Timestamps of share arrival */
         json_set_string(blockval, "share_date", share_stamp);
@@ -7810,6 +7917,8 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 
         blockval = json_deep_copy(wb->payout);
         json_set_string(blockval, "solvedby", client->workername ? client->workername : client->user_instance->username);
+        if (ckp->solo && client && client->user_instance && client->user_instance->username[0])
+            replace_solominer_payout(blockval, client->user_instance->username);
 
         json_set_string(blockval, "share_date", share_stamp);
         json_set_string(blockval, "share_date_localtime", share_stamp_local);
@@ -10650,7 +10759,7 @@ static void *statsupdate(void *arg)
     while (42) {
         double ghs, ghs1, ghs5, ghs15, ghs60, ghs360, ghs1440, ghs10080,
             per_tdiff, hmul = 1, lmul = 1, rolling_herp, rolling_lns,
-            reward, derp, percent, exact_net_diff = 0.0;
+            reward, derp, percent, exact_net_diff = 0.0, solo_cb_reward = 0.0;
         char suffix1[16], suffix5[16], suffix15[16], suffix60[16], suffix240[16], cdfield[64];
         char suffix360[16], suffix1440[16], suffix10080[16];
         char pcstring[32];
@@ -10663,7 +10772,7 @@ static void *statsupdate(void *arg)
         char *fname, *s, *sp;
         tv_t now, diff;
         ts_t ts_now;
-        json_t *val;
+        json_t *val = NULL, *cur_payout_snap = NULL, *cur_payouts_obj = NULL;
         FILE *fp;
         int i;
         pool_stats_t stats_copy_store; /* snapshot local copy of the shared pool stats (copy made with locks held) */
@@ -10707,13 +10816,23 @@ static void *statsupdate(void *arg)
         reward = stats->reward;
         mutex_unlock(&sdata->stats_lock);
 
-        /* Obtain exact floating-point network diff once per cycle for accurate user and pool diff calculations */
+        /* Snapshot exact network diff and current coinbase payout table once per cycle so
+         * user cb_reward values and pool.work stay 100% synchronized. */
         ck_rlock(&sdata->workbase_lock);
-        if (sdata->current_workbase)
+        if (sdata->current_workbase) {
             exact_net_diff = sdata->current_workbase->network_diff;
+            if (sdata->current_workbase->payout)
+                cur_payout_snap = json_deep_copy(sdata->current_workbase->payout);
+        }
         ck_runlock(&sdata->workbase_lock);
         if (exact_net_diff <= 0.0)
             exact_net_diff = (double)stats->network_diff;
+
+        if (likely(cur_payout_snap)) {
+            cur_payouts_obj = json_object_get(cur_payout_snap, "payouts");
+            if (ckp->solo && cur_payouts_obj)
+                json_get_double(&solo_cb_reward, cur_payouts_obj, "<solominer>");
+        }
 
         ck_wlock(&sdata->instance_lock);
         /* Grab the first entry */
@@ -10774,7 +10893,8 @@ static void *statsupdate(void *arg)
             worker_instance_t *worker;
             json_t *user_array;
             int64_t u_accepted = 0, u_rejected = 0;
-            double rj_ratio = 0.0, user_diff = 0.0;
+            double rj_ratio = 0.0, user_diff = 0.0, cb_reward = 0.0;
+            int active_workers = user->workers + user->remote_workers;
 
             if (!user->authorized)
                 continue;
@@ -10928,7 +11048,7 @@ static void *statsupdate(void *arg)
             else
                 rj_ratio = 0.0;
 
-            /* Calculate round share diff ratio vs BCH network diff using exact float difficulty */
+            /* Calculate round share diff ratio vs network diff using exact float difficulty */
             if (exact_net_diff > 0.0)
                 user_diff = ((double)u_accepted * 100.0) / exact_net_diff;
             else
@@ -10939,7 +11059,7 @@ static void *statsupdate(void *arg)
             snprintf(rj_str, sizeof(rj_str), "%.4f", rj_ratio);
             snprintf(diff_str, sizeof(diff_str), "%.4f", user_diff);
 
-            /* Round to satoshi, change to BTC, removing fee */
+            /* Round to satoshi, change to coins, removing fee */
             derp = floor(reward * (user->herp +user->accumulated) / rolling_herp * 0.995);
             /* Needs payout, leave more space in coinbase
              * for generation txn to this user */
@@ -10951,7 +11071,18 @@ static void *statsupdate(void *arg)
                 percent = round(user->herp / user->lns * 100) / 100;
             else
                 percent = 1.0;
-            JSON_CPACK(val, "{ss,ss,ss,ss,ss,ss,sI,si,sI,sf,sf,sI,sI,ss,ss,sf,sf,sf,si,sf,sf,sI}",
+
+            /* Determine exact cb_reward strictly matching pool.work:
+             * - SOLO mode: solo_cb_reward while active, 0.0 once completely disconnected.
+             * - SPLNS mode: O(1) lookup from current coinbase payouts even if disconnected
+             *   until washed out below PAYOUT_DUST (546 sats). */
+            if (ckp->solo) {
+                cb_reward = (active_workers > 0) ? solo_cb_reward : 0.0;
+            } else if (cur_payouts_obj) {
+                json_get_double(&cb_reward, cur_payouts_obj, user->username);
+            }
+
+            JSON_CPACK(val, "{ss,ss,ss,ss,ss,ss,sI,si,sI,sf,sf,sI,sI,ss,ss,sf,sf,sf,sf,si,sf,sf,sI}",
                        "hashrate1m", suffix1,
                        "hashrate5m", suffix5,
                        "hashrate1hr", suffix60,
@@ -10959,7 +11090,7 @@ static void *statsupdate(void *arg)
                        "hashrate1d", suffix1440,
                        "hashrate7d", suffix10080,
                        "lastshare", (json_int_t)user->last_share.tv_sec,
-                       "workers", user->workers + user->remote_workers,
+                       "workers", active_workers,
                        "shares", (json_int_t)user->shares,
                        "bestshare", user->best_diff,
                        "bestshare_alltime", user->best_diff_alltime,
@@ -10969,6 +11100,7 @@ static void *statsupdate(void *arg)
                        "diff", diff_str,
                        "lns", user->lns,
                        "luck", percent,
+                       "cb_reward", cb_reward,
                        "accumulated", user->accumulated,
                        "postponed", user->postponed,
                        "herp", user->herp,
@@ -10987,8 +11119,12 @@ static void *statsupdate(void *arg)
             }
 
             if (!inactive) {
-                s = json_dumps(val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER |
-                                    JSON_COMPACT | JSON_REAL_PRECISION(16));
+                /* Keep cb_reward strictly inside /logs/users/<wallet>; omit from logs and pool.miners */
+                json_t *log_val = json_copy(val);
+                json_object_del(log_val, "cb_reward");
+                s = json_dumps(log_val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER |
+                                        JSON_COMPACT | JSON_REAL_PRECISION(16));
+                json_decref(log_val);
                 if (!idle) {
                     /* It's convenient to see the biggest hashers last
                      * when tail'ing the log as it's being written. */
@@ -11029,6 +11165,7 @@ static void *statsupdate(void *arg)
                                 JSON_REAL_PRECISION(16) | JSON_INDENT(2));
             add_log_entry(&log_entries, &fname, &s);
             json_decref(val);
+            val = NULL;
             if (ckp->remote)
                 upstream_workers(ckp, user);
         }
@@ -11181,24 +11318,28 @@ static void *statsupdate(void *arg)
         update_pool_blocks_file(ckp, sdata, stats_copy); 
         update_node_status_file(ckp);
 
-        ck_rlock(&sdata->workbase_lock);
-        if (likely(sdata->current_workbase && sdata->current_workbase->payout))
-            val = json_deep_copy(sdata->current_workbase->payout);
-        ck_runlock(&sdata->workbase_lock);
+        /* Write the exact same payout snapshot used for user cb_reward to pool.work */
+        if (unlikely(!cur_payout_snap)) {
+            ck_rlock(&sdata->workbase_lock);
+            if (likely(sdata->current_workbase && sdata->current_workbase->payout))
+                cur_payout_snap = json_deep_copy(sdata->current_workbase->payout);
+            ck_runlock(&sdata->workbase_lock);
+        }
 
-        if (likely(val)) {
+        if (likely(cur_payout_snap)) {
             ASPRINTF(&fname, "%s/pool/pool.work", ckp->logdir);
             fp = fopen(fname, "we");
             if (unlikely(!fp)) {
                 LOGERR("Failed to fopen %s", fname);
             } else {
-                s = json_dumps(val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER |
-                                    JSON_REAL_PRECISION(12) | JSON_INDENT(2) | JSON_EOL);
+                s = json_dumps(cur_payout_snap, JSON_NO_UTF8 | JSON_PRESERVE_ORDER |
+                                                JSON_REAL_PRECISION(12) | JSON_INDENT(2) | JSON_EOL);
                 fprintf(fp, "%s", s);
                 dealloc(s);
                 fclose(fp);
             }
-            json_decref(val);
+            json_decref(cur_payout_snap);
+            cur_payout_snap = NULL;
             dealloc(fname);
         }
 
