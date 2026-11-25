@@ -11694,10 +11694,10 @@ void *stratifier(void *arg)
     threads = threads > 0 ? threads : 1;
     sdata->updateq = create_ckmsgq(ckp, "updater", &block_update);
     sdata->sshareq = create_ckmsgqs(ckp, "sprocessor", &sshare_process, threads);
-    sdata->ssends = create_ckmsgqs(ckp, "ssender", &ssend_process, threads);
+    sdata->ssends = create_ckmsgq(ckp, "ssender", &ssend_process);
     sdata->sauthq = create_ckmsgq(ckp, "authorizer", &sauth_process);
     sdata->stxnq = create_ckmsgq(ckp, "stxnq", &send_transactions);
-    sdata->srecvs = create_ckmsgqs(ckp, "sreceiver", &srecv_process, threads);
+    sdata->srecvs = create_ckmsgq(ckp, "sreceiver", &srecv_process);
     read_poolstats(ckp, &tvsec_diff);
     read_userstats(ckp, sdata, tvsec_diff);
     read_unconfirmed_blocks(ckp, sdata); /* Restore unconfirmed blocks from the disk */
