@@ -13,6 +13,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <string.h>
 #include <unistd.h>
@@ -25,18 +26,29 @@
 #include "generator.h"
 
 #define MAX_MSGSIZE 1024
+/* Finite ceiling for trusted remote / node peers to prevent unbounded recv growth */
+#define MAX_REMOTE_MSGSIZE (16 * 1024 * 1024)
+
+/* Reap silent TCP sockets that never deliver a complete Stratum JSON message */
+#define IDLE_ACCEPT_TIMEOUT 60
+#define IDLE_REAP_BATCH 128
+
+/* Per-client queued outbound byte ceilings to prevent OOM from stalled peers */
+#define DEFAULT_SENDQUEUE_LIMIT (1024 * 1024)
+#define REMOTE_SENDQUEUE_LIMIT (64 * 1024 * 1024)
 
 typedef struct client_instance client_instance_t;
 typedef struct sender_send sender_send_t;
 typedef struct share share_t;
 typedef struct redirect redirect_t;
+typedef struct csender csender_t;
 
 struct client_instance {
     /* For clients hashtable */
     UT_hash_handle hh;
     int64_t id;
 
-    /* fd cannot be changed while a ref is held */
+    /* fd is only closed once ref drops to 0 to prevent kernel fd reuse races */
     int fd;
 
     /* Reference count for when this instance is used outside of the
@@ -52,7 +64,6 @@ struct client_instance {
 
     client_instance_t *recycled_next;
     client_instance_t *recycled_prev;
-
 
     struct sockaddr_storage address_storage;
     struct sockaddr *address;
@@ -73,7 +84,7 @@ struct client_instance {
     /* Is this the parent passthrough client */
     bool passthrough;
 
-    /* Linked list of shares in redirector mode.*/
+    /* Linked list of shares in redirector mode */
     share_t *shares;
 
     /* Has this client already been told to redirect */
@@ -84,8 +95,15 @@ struct client_instance {
     /* Time this client started blocking, 0 when not blocked */
     time_t blocked_time;
 
-    /* The size of the socket send buffer */
+    /* Pre-session DoS protection: protected by cdata->lock */
+    time_t accept_time;
+    bool got_msg;
+
+    /* The size of the socket send buffer (SO_SNDBUF) */
     int sendbufsize;
+
+    /* Bytes currently queued but not yet written; protected by owning csender->lock */
+    int64_t queued_bytes;
 };
 
 struct sender_send {
@@ -96,6 +114,7 @@ struct sender_send {
     char *buf;
     int len;
     int ofs;
+    int qlen; /* Original byte length accounted against client->queued_bytes */
 };
 
 struct share {
@@ -129,7 +148,6 @@ struct connector_data {
     int epfd;
 
     bool accept;
-    pthread_t pth_sender;
     pthread_t pth_receiver;
 
     /* For the hashtable of all clients */
@@ -150,17 +168,9 @@ struct connector_data {
     /* client message event process queue */
     ckmsgq_t *cevents;
 
-    /* For the linked list of pending sends */
-    sender_send_t *sender_sends;
-
-    int64_t sends_generated;
-    int64_t sends_delayed;
-    int64_t sends_queued;
-    int64_t sends_size;
-
-    /* For protecting the pending sends list */
-    mutex_t sender_lock;
-    pthread_cond_t sender_cond;
+    /* Sharded sender threads: each client maps to id % nsenders (single-writer FIFO) */
+    int nsenders;
+    csender_t *csenders;
 
     /* Hash list of all redirected IP address in redirector mode */
     redirect_t *redirects;
@@ -173,6 +183,26 @@ struct connector_data {
 };
 
 typedef struct connector_data cdata_t;
+
+struct csender {
+    cdata_t *cdata;
+    int id;
+
+    sender_send_t *sends;
+
+    int64_t sends_generated;
+    int64_t sends_delayed;
+    int64_t sends_queued;
+    int64_t sends_size;
+
+    mutex_t lock;
+    pthread_cond_t cond;
+    pthread_t pth;
+};
+
+static int drop_client__(cdata_t *cdata, client_instance_t *client);
+static void reap_dead_clients(cdata_t *cdata);
+static void send_client(pool_t *ckp, cdata_t *cdata, const int64_t id, char *buf);
 
 void connector_upstream_msg(pool_t *ckp, char *msg)
 {
@@ -195,7 +225,7 @@ static void inc_instance_ref(cdata_t *cdata, client_instance_t *client)
     ck_wunlock(&cdata->lock);
 }
 
-/* Increase the reference count of instance */
+/* Decrease the reference count of instance */
 static void dec_instance_ref__(client_instance_t *client)
 {
     client->ref--;
@@ -203,9 +233,16 @@ static void dec_instance_ref__(client_instance_t *client)
 
 static void dec_instance_ref(cdata_t *cdata, client_instance_t *client)
 {
+    bool need_reap = false;
+
     ck_wlock(&cdata->lock);
     dec_instance_ref__(client);
+    if (unlikely(client->invalid && !client->ref))
+        need_reap = true;
     ck_wunlock(&cdata->lock);
+
+    if (unlikely(need_reap))
+        reap_dead_clients(cdata);
 }
 
 /* Recruit a client structure from a recycled one if available, creating a
@@ -228,6 +265,8 @@ static client_instance_t *recruit_client(cdata_t *cdata)
     } else
         LOGDEBUG("Connector recycled client instance");
 
+    client->id = -1;
+    client->fd = -1;
     client->buf = ckzalloc(PAGESIZE);
 
     return client;
@@ -235,9 +274,16 @@ static client_instance_t *recruit_client(cdata_t *cdata)
 
 static void recycle_client__(cdata_t *cdata, client_instance_t *client)
 {
+    share_t *share, *tmp;
+
     dealloc(client->buf);
+    DL_FOREACH_SAFE(client->shares, share, tmp) {
+        DL_DELETE(client->shares, share);
+        dealloc(share);
+    }
     memset(client, 0, sizeof(client_instance_t));
     client->id = -1;
+    client->fd = -1;
     DL_APPEND2(cdata->recycled_clients, client, recycled_prev, recycled_next);
 }
 
@@ -271,32 +317,70 @@ static int accept_client(cdata_t *cdata, const int epfd, const uint64_t server)
     client_instance_t *client;
     socklen_t address_len;
     socklen_t optlen;
+    const int on = 1;
 
     ck_rlock(&cdata->lock);
     no_clients = HASH_COUNT(cdata->clients);
     ck_runlock(&cdata->lock);
 
+    sockd = cdata->serverfd[server];
+
     if (unlikely(ckp->maxclients && no_clients >= ckp->maxclients)) {
-        LOGWARNING("Server full with %d clients", no_clients);
+        static time_t last_full_warn = 0;
+        static int full_suppressed = 0;
+        time_t now_t = time(NULL);
+
+        /* Drain level-triggered listen socket to avoid 100% CPU spin */
+        fd = accept(sockd, NULL, NULL);
+        if (likely(fd >= 0))
+            Close(fd);
+        if (now_t - last_full_warn >= 60) {
+            if (full_suppressed) {
+                LOGWARNING("Server full with %d clients (%d further connections dropped)",
+                           no_clients, full_suppressed);
+            } else {
+                LOGWARNING("Server full with %d clients", no_clients);
+            }
+            last_full_warn = now_t;
+            full_suppressed = 0;
+        } else {
+            full_suppressed++;
+        }
         return 0;
     }
 
-    sockd = cdata->serverfd[server];
     client = recruit_client(cdata);
     client->server = server;
     client->address = (struct sockaddr *)&client->address_storage;
     address_len = sizeof(client->address_storage);
     fd = accept(sockd, client->address, &address_len);
     if (unlikely(fd < 0)) {
-        /* Handle these errors gracefully should we ever share this
-         * socket */
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ECONNABORTED) {
-            LOGERR("Recoverable error on accept in accept_client");
-            return 0;
-        }
-        LOGERR("Failed to accept on socket %d in acceptor", sockd);
+        static time_t last_res_warn = 0;
+        int err = errno;
+
         recycle_client(cdata, client);
-        return -1;
+        switch (err) {
+            case EBADF:
+            case EFAULT:
+            case EINVAL:
+            case ENOTSOCK:
+            case EOPNOTSUPP:
+                LOGERR("Failed to accept on socket %d in acceptor: %s", sockd, strerror(err));
+                return -1;
+            case EMFILE:
+            case ENFILE:
+            case ENOBUFS:
+            case ENOMEM:
+                if (time(NULL) - last_res_warn >= 60) {
+                    LOGWARNING("Unable to accept on socket %d: %s", sockd, strerror(err));
+                    last_res_warn = time(NULL);
+                }
+                cksleep_ms(100);
+                return 0;
+            default:
+                LOGNOTICE("Recoverable error on accept in accept_client: %s", strerror(err));
+                return 0;
+        }
     }
 
     switch (client->address->sa_family) {
@@ -306,12 +390,12 @@ static int accept_client(cdata_t *cdata, const int epfd, const uint64_t server)
         case AF_INET:
             inet4_in = (struct sockaddr_in *)client->address;
             inet_ntop(AF_INET, &inet4_in->sin_addr, client->address_name, INET6_ADDRSTRLEN);
-            port = htons(inet4_in->sin_port);
+            port = ntohs(inet4_in->sin_port);
             break;
         case AF_INET6:
             inet6_in = (struct sockaddr_in6 *)client->address;
             inet_ntop(AF_INET6, &inet6_in->sin6_addr, client->address_name, INET6_ADDRSTRLEN);
-            port = htons(inet6_in->sin6_port);
+            port = ntohs(inet6_in->sin6_port);
             break;
         default:
             LOGWARNING("Unknown INET type for client %d on socket %d",
@@ -321,36 +405,45 @@ static int accept_client(cdata_t *cdata, const int epfd, const uint64_t server)
             return 0;
     }
 
+    /* Configure low-latency non-blocking TCP socket before publishing */
     keep_sockalive(fd);
     noblock_socket(fd);
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+
+    /* Populate all immutable/initial fields BEFORE publishing into cdata->clients */
+    client->fd = fd;
+    client->accept_time = time(NULL);
+    client->got_msg = false;
+    optlen = sizeof(client->sendbufsize);
+    getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &client->sendbufsize, &optlen);
+    LOGDEBUG("Client sendbufsize detected as %d", client->sendbufsize);
 
     LOGINFO("Connected new client %d on socket %d to %d active clients from %s:%d",
         cdata->nfds, fd, no_clients, client->address_name, port);
 
+    /* Atomically assign id, take epoll refcount=1, and publish under write lock */
     ck_wlock(&cdata->lock);
     client->id = cdata->client_ids++;
+    inc_instance_ref__(client);
     HASH_ADD_I64(cdata->clients, id, client);
     cdata->nfds++;
     ck_wunlock(&cdata->lock);
 
-    /* We increase the ref count on this client as epoll creates a pointer
-     * to it. We drop that reference when the socket is closed which
-     * removes it automatically from the epoll list. */
-    inc_instance_ref__(client);
-    client->fd = fd;
-    optlen = sizeof(client->sendbufsize);
-    getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &client->sendbufsize, &optlen);
-    LOGDEBUG("Client sendbufsize detected as %d", client->sendbufsize);
-
     if (unlikely(epfd_add(epfd, fd, client->id, true, true, false)) < 0) {
         LOGERR("Failed to epfd_add in accept_client");
-        dec_instance_ref(cdata, client);
+        ck_wlock(&cdata->lock);
+        drop_client__(cdata, client);
+        ck_wunlock(&cdata->lock);
+        reap_dead_clients(cdata);
         return 0;
     }
 
     return 1;
 }
 
+/* Mark client invalid, unhash it, and shut down the socket without closing the
+ * fd yet. Keeping the fd reserved until ref == 0 eliminates any possibility of
+ * accept() reusing the fd number while a sender thread is still writing to it. */
 static int drop_client__(cdata_t *cdata, client_instance_t *client)
 {
     int ret = -1;
@@ -359,16 +452,35 @@ static int drop_client__(cdata_t *cdata, client_instance_t *client)
         goto out;
     client->invalid = true;
     ret = client->fd;
-    /* Closing the fd will automatically remove it from the epoll list */
-    Close(client->fd);
+    if (likely(client->fd >= 0))
+        shutdown(client->fd, SHUT_RDWR);
     HASH_DEL(cdata->clients, client);
     DL_APPEND2(cdata->dead_clients, client, dead_prev, dead_next);
-    /* This is the reference to this client's presence in the
-     * epoll list. */
+    /* Drop the reference representing this client's presence in epoll */
     dec_instance_ref__(client);
     cdata->dead_generated++;
 out:
     return ret;
+}
+
+/* Close and recycle all dead clients whose reference counts have reached zero */
+static void reap_dead_clients(cdata_t *cdata)
+{
+    client_instance_t *dead, *tmp;
+
+    ck_wlock(&cdata->lock);
+    DL_FOREACH_SAFE2(cdata->dead_clients, dead, tmp, dead_next) {
+        if (!dead->ref) {
+            DL_DELETE2(cdata->dead_clients, dead, dead_prev, dead_next);
+            LOGINFO("Connector recycling client %"PRId64, dead->id);
+            if (likely(dead->fd >= 0)) {
+                nolinger_socket(dead->fd);
+                Close(dead->fd);
+            }
+            recycle_client__(cdata, dead);
+        }
+    }
+    ck_wunlock(&cdata->lock);
 }
 
 static void stratifier_drop_id(pool_t *ckp, const int64_t id)
@@ -379,19 +491,14 @@ static void stratifier_drop_id(pool_t *ckp, const int64_t id)
     send_proc(ckp->stratifier, buf);
 }
 
-/* Client must hold a reference count */
-static int drop_client(cdata_t *cdata, client_instance_t *client)
+/* Complete side effects after drop_client__ has atomically invalidated client */
+static int finish_drop_client(pool_t *ckp, client_instance_t *client, int fd)
 {
     bool passthrough = client->passthrough, remote = client->remote;
     char address_name[INET6_ADDRSTRLEN];
     int64_t client_id = client->id;
-    int fd = -1;
 
     strcpy(address_name, client->address_name);
-    ck_wlock(&cdata->lock);
-    fd = drop_client__(cdata, client);
-    ck_wunlock(&cdata->lock);
-
     if (fd > -1) {
         if (passthrough) {
             LOGNOTICE("Connector dropped passthrough %"PRId64" %s",
@@ -401,7 +508,7 @@ static int drop_client(cdata_t *cdata, client_instance_t *client)
                    client_id, address_name);
         }
         LOGDEBUG("Connector dropped fd %d", fd);
-        stratifier_drop_id(cdata->ckp, client_id);
+        stratifier_drop_id(ckp, client_id);
     }
 
     return fd;
@@ -423,53 +530,51 @@ static void stratifier_drop_client(pool_t *ckp, const client_instance_t *client)
     stratifier_drop_id(ckp, client->id);
 }
 
-/* Invalidate this instance. Remove them from the hashtables we look up
- * regularly but keep the instances in a linked list until their ref count
- * drops to zero when we can remove them lazily. Client must hold a reference
- * count. */
-static int invalidate_client(pool_t *ckp, cdata_t *cdata, client_instance_t *client)
+/* Complete invalidation side effects and reap unreferenced dead clients */
+static int finish_invalidate_client(pool_t *ckp, cdata_t *cdata, client_instance_t *client, int ret)
 {
-    client_instance_t *tmp;
-    int ret;
-
-    ret = drop_client(cdata, client);
+    ret = finish_drop_client(ckp, client, ret);
     if ((!ckp->passthrough || ckp->node) && !client->passthrough)
         stratifier_drop_client(ckp, client);
     if (ckp->passthrough)
         generator_drop_client(ckp, client);
 
-    /* Cull old unused clients lazily when there are no more reference
-     * counts for them. */
-    ck_wlock(&cdata->lock);
-    DL_FOREACH_SAFE2(cdata->dead_clients, client, tmp, dead_next) {
-        if (!client->ref) {
-            DL_DELETE2(cdata->dead_clients, client, dead_prev, dead_next);
-            LOGINFO("Connector recycling client %"PRId64, client->id);
-            /* We only close the client fd once we're sure there
-             * are no references to it left to prevent fds being
-             * reused on new and old clients. */
-            nolinger_socket(client->fd);
-            Close(client->fd);
-            recycle_client__(cdata, client);
-        }
-    }
-    ck_wunlock(&cdata->lock);
-
+    reap_dead_clients(cdata);
     return ret;
+}
+
+/* Invalidate this instance. Client must hold a reference count. */
+static int invalidate_client(pool_t *ckp, cdata_t *cdata, client_instance_t *client)
+{
+    int ret;
+
+    ck_wlock(&cdata->lock);
+    ret = drop_client__(cdata, client);
+    ck_wunlock(&cdata->lock);
+    return finish_invalidate_client(ckp, cdata, client, ret);
 }
 
 static void drop_all_clients(cdata_t *cdata)
 {
     client_instance_t *client, *tmp;
+    int64_t *ids = NULL;
+    int n = 0, i;
 
     ck_wlock(&cdata->lock);
     HASH_ITER(hh, cdata->clients, client, tmp) {
-        drop_client__(cdata, client);
+        int64_t id = client->id;
+        if (drop_client__(cdata, client) > -1) {
+            ids = ckrealloc(ids, (size_t)(n + 1) * sizeof(*ids));
+            ids[n++] = id;
+        }
     }
     ck_wunlock(&cdata->lock);
-}
 
-static void send_client(pool_t *ckp, cdata_t *cdata, int64_t id, char *buf);
+    for (i = 0; i < n; i++)
+        stratifier_drop_id(cdata->ckp, ids[i]);
+    dealloc(ids);
+    reap_dead_clients(cdata);
+}
 
 /* Look for shares being submitted via a redirector and add them to a linked
  * list for looking up the responses. */
@@ -490,12 +595,10 @@ static void parse_redirector_share(cdata_t *cdata, client_instance_t *client, co
 
     LOGINFO("Redirector adding client %"PRId64" share id: %"PRId64, client->id, id);
 
-    /* We use the cdata lock instead of a separate lock since this function
-     * is called infrequently. */
     ck_wlock(&cdata->lock);
     DL_APPEND(client->shares, share);
 
-    /* Age old shares. */
+    /* Age old shares */
     DL_FOREACH_SAFE(client->shares, share, tmp) {
         if (now > share->submitted + 120) {
             DL_DELETE(client->shares, share);
@@ -515,23 +618,34 @@ static bool parse_client_msg(pool_t *ckp, cdata_t *cdata, client_instance_t *cli
 
 retry:
     if (unlikely(client->bufofs > MAX_MSGSIZE)) {
-        if (!client->remote) {
+        if (unlikely(!client->remote || client->bufofs > MAX_REMOTE_MSGSIZE)) {
             LOGNOTICE("Client id %"PRId64" fd %d overloaded buffer without EOL, disconnecting",
                 client->id, client->fd);
             return false;
         }
-        client->buf = realloc(client->buf, round_up_page(client->bufofs + MAX_MSGSIZE + 1));
+        char *newbuf = realloc(client->buf, round_up_page(client->bufofs + MAX_MSGSIZE + 1));
+        if (unlikely(!newbuf)) {
+            LOGERR("Client id %"PRId64" failed to grow remote recv buffer", client->id);
+            return false;
+        }
+        client->buf = newbuf;
     }
-    /* This read call is non-blocking since the socket is set to O_NOBLOCK */
+    /* This read call is non-blocking since the socket is set to O_NONBLOCK */
     ret = read(client->fd, client->buf + client->bufofs, MAX_MSGSIZE);
-    if (ret < 1) {
-        if (likely(errno == EAGAIN || errno == EWOULDBLOCK || !ret))
+    if (ret == 0) {
+        /* Clean TCP EOF from peer */
+        LOGINFO("Client id %"PRId64" fd %d closed connection (EOF)", client->id, client->fd);
+        return false;
+    }
+    if (ret < 0) {
+        if (likely(errno == EAGAIN || errno == EWOULDBLOCK))
             return true;
         LOGINFO("Client id %"PRId64" fd %d disconnected - recv fail with bufofs %lu ret %d errno %d %s",
-            client->id, client->fd, client->bufofs, ret, errno, ret && errno ? strerror(errno) : "");
+            client->id, client->fd, client->bufofs, ret, errno, strerror(errno));
         return false;
     }
     client->bufofs += ret;
+    client->buf[client->bufofs] = '\0';
 reparse:
     eol = memchr(client->buf, '\n', client->bufofs);
     if (!eol)
@@ -539,12 +653,13 @@ reparse:
 
     /* Do something useful with this message now */
     buflen = eol - client->buf + 1;
-    if (unlikely(buflen > MAX_MSGSIZE && !client->remote)) {
+    if (unlikely(buflen > MAX_MSGSIZE && (!client->remote || buflen > MAX_REMOTE_MSGSIZE))) {
         LOGNOTICE("Client id %"PRId64" fd %d message oversize, disconnecting", client->id, client->fd);
         return false;
     }
 
-    if (!(val = json_loads(client->buf, JSON_DISABLE_EOF_CHECK, NULL))) {
+    if (unlikely(client->buf[0] != '{' ||
+        !(val = json_loads(client->buf, JSON_DISABLE_EOF_CHECK, NULL)))) {
         char *buf = strdup("Invalid JSON, disconnecting\n");
 
         LOGINFO("Client id %"PRId64" sent invalid json message %s", client->id, client->buf);
@@ -552,10 +667,11 @@ reparse:
         return false;
     } else {
         if (client->passthrough) {
-            int64_t passthrough_id;
+            int64_t passthrough_id = 0;
 
             json_getdel_int64(&passthrough_id, val, "client_id");
-            passthrough_id = (client->id << 32) | passthrough_id;
+            /* Restrict remotely supplied subclient id to lower 32 bits */
+            passthrough_id = (client->id << 32) | (passthrough_id & 0xffffffffLL);
             json_object_set_new_nocheck(val, "client_id", json_integer(passthrough_id));
         } else {
             if (ckp->redirector && !client->redirected && strstr(client->buf, "mining.submit"))
@@ -564,6 +680,13 @@ reparse:
             json_object_set_new_nocheck(val, "address", json_string(client->address_name));
         }
         json_object_set_new_nocheck(val, "server", json_integer(client->server));
+
+        /* Mark client as actively speaking Stratum protocol */
+        if (unlikely(!client->got_msg)) {
+            ck_wlock(&cdata->lock);
+            client->got_msg = true;
+            ck_wunlock(&cdata->lock);
+        }
 
         /* Do not send messages of clients we've already dropped. We
          * do this unlocked as the occasional false negative can be
@@ -605,7 +728,16 @@ static client_instance_t *ref_client_by_id(cdata_t *cdata, int64_t id)
     return client;
 }
 
-static void redirect_client(pool_t *ckp, client_instance_t *client);
+/* Safely drop a client by id when caller does not hold a reference */
+static void drop_client_by_id(pool_t *ckp, cdata_t *cdata, const int64_t id)
+{
+    client_instance_t *client = ref_client_by_id(cdata, id);
+
+    if (unlikely(!client))
+        return;
+    invalidate_client(ckp, cdata, client);
+    dec_instance_ref(cdata, client);
+}
 
 static bool redirect_matches(cdata_t *cdata, client_instance_t *client)
 {
@@ -643,10 +775,8 @@ static void client_event_processor(pool_t *ckp, aevt_t *event)
         socklen_t errlen = sizeof(int);
         int error = 0;
 
-        /* See what type of error this is and raise the log
-            * level of the message if it's unexpected. */
         getsockopt(client->fd, SOL_SOCKET, SO_ERROR, (void *)&error, &errlen);
-        if (error != 104) {
+        if (error != ECONNRESET) {
             LOGNOTICE("Client id %"PRId64" fd %d epollerr HUP in epoll with errno %d: %s",
                     client->id, client->fd, error, strerror(error));
         } else {
@@ -655,11 +785,9 @@ static void client_event_processor(pool_t *ckp, aevt_t *event)
         }
         invalidate_client(cdata->pi->ckp, cdata, client);
     } else if (unlikely(event->hup)) {
-        /* Client connection reset by peer */
         LOGINFO("Client id %"PRId64" fd %d HUP in epoll", client->id, client->fd);
         invalidate_client(cdata->pi->ckp, cdata, client);
     } else if (unlikely(event->rdhup)) {
-        /* Client disconnected by peer */
         LOGINFO("Client id %"PRId64" fd %d RDHUP in epoll", client->id, client->fd);
         invalidate_client(cdata->pi->ckp, cdata, client);
     }
@@ -673,10 +801,54 @@ outnoclient:
     free(event);
 }
 
+/* Reap silent TCP connections that connected but never sent a single Stratum
+ * JSON line within IDLE_ACCEPT_TIMEOUT seconds (anti-Slowloris / fd exhaustion). */
+static void reap_idle_clients(pool_t *ckp, cdata_t *cdata)
+{
+    int64_t ids[IDLE_REAP_BATCH];
+    client_instance_t *client, *tmp;
+    time_t now_t = time(NULL);
+    int nids = 0, i;
+
+    ck_rlock(&cdata->lock);
+    HASH_ITER(hh, cdata->clients, client, tmp) {
+        if (client->invalid || client->got_msg)
+            continue;
+        if (now_t - client->accept_time > IDLE_ACCEPT_TIMEOUT) {
+            ids[nids++] = client->id;
+            if (unlikely(nids >= IDLE_REAP_BATCH))
+                break;
+        }
+    }
+    ck_runlock(&cdata->lock);
+
+    for (i = 0; i < nids; i++) {
+        int fd = -1;
+
+        client = ref_client_by_id(cdata, ids[i]);
+        if (unlikely(!client))
+            continue;
+
+        ck_wlock(&cdata->lock);
+        if (!client->invalid && !client->got_msg &&
+            now_t - client->accept_time > IDLE_ACCEPT_TIMEOUT)
+            fd = drop_client__(cdata, client);
+        ck_wunlock(&cdata->lock);
+
+        if (fd >= 0) {
+            LOGNOTICE("Reaping client id %"PRId64" %s idle without a message for %d seconds",
+                      client->id, client->address_name, IDLE_ACCEPT_TIMEOUT);
+            finish_invalidate_client(ckp, cdata, client, fd);
+        }
+        dec_instance_ref(cdata, client);
+    }
+}
+
 /* Waits on fds ready to read on from the list stored in conn_instance and
  * handles the incoming messages */
 static void *receiver(void *arg)
 {
+    time_t last_reap = time(NULL);
     cdata_t *cdata = (cdata_t *)arg;
     aevt_t *event = ckzalloc(sizeof(aevt_t));
     pool_t *ckp = cdata->ckp;
@@ -693,7 +865,6 @@ static void *receiver(void *arg)
     serverfds = ckp->serverurls;
     /* Add all the serverfds to the epfd */
     for (i = 0; i < serverfds; i++) {
-        /* The small values will be less than the first client ids */
         ret = epfd_add(epfd, cdata->serverfd[i], i, true, false, false);
         if (ret < 0) {
             LOGEMERG("FATAL: Failed to add epfd_add fd %d to epfd %d", cdata->serverfd[i], epfd);
@@ -707,10 +878,20 @@ static void *receiver(void *arg)
 
     while (42) {
         uint64_t edu64;
+        time_t now_t;
 
         while (unlikely(!cdata->accept))
             cksleep_ms(10);
         ret = epfd_wait(epfd, event, 1000);
+
+        /* Periodic 1s housekeeping: reap silent sockets and close unreferenced dead fds */
+        now_t = time(NULL);
+        if (now_t != last_reap) {
+            last_reap = now_t;
+            reap_idle_clients(ckp, cdata);
+            reap_dead_clients(cdata);
+        }
+
         if (unlikely(ret < 1)) {
             if (unlikely(ret == -1)) {
                 if (errno == EINTR)
@@ -718,7 +899,6 @@ static void *receiver(void *arg)
                 LOGEMERG("FATAL: Failed to epfd_wait in receiver");
                 break;
             }
-            /* Nothing to service, still very unlikely */
             continue;
         }
         edu64 = event->userdata;
@@ -736,7 +916,6 @@ static void *receiver(void *arg)
         event = ckzalloc(sizeof(aevt_t));
     }
 out:
-    /* We shouldn't get here unless there's an error */
     if (event) dealloc(event);
     return NULL;
 }
@@ -764,14 +943,14 @@ static bool send_sender_send(pool_t *ckp, cdata_t *cdata, sender_send_t *sender_
         client->sendbufsize = set_sendbufsize(ckp, client->fd, sender_send->len);
 
     while (sender_send->len) {
-        int ret = write(client->fd, sender_send->buf + sender_send->ofs, sender_send->len);
+        ssize_t ret = send(client->fd, sender_send->buf + sender_send->ofs,
+                           sender_send->len, MSG_NOSIGNAL);
 
         if (ret < 1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || !ret) {
+            if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 if (!client->blocked_time) {
                     client->blocked_time = now_t;
-                } else { // ... client->blocked_time != 0 ...
-                    /* Invalidate clients that block for more than blocking_timeout seconds (default: 60) */
+                } else {
                     const time_t blocking_timeout = ckp->blocking_timeout > 0 ? ckp->blocking_timeout : 60;
                     if (unlikely(now_t - client->blocked_time >= blocking_timeout)) {
                         LOGNOTICE("Client id %"PRId64" fd %d blocked for >%"PRId64" seconds, disconnecting",
@@ -782,13 +961,13 @@ static bool send_sender_send(pool_t *ckp, cdata_t *cdata, sender_send_t *sender_
                 }
                 return false;
             }
-            LOGINFO("Client id %"PRId64" fd %d disconnected with write errno %d:%s",
+            LOGINFO("Client id %"PRId64" fd %d disconnected with send errno %d:%s",
                 client->id, client->fd, errno, strerror(errno));
             invalidate_client(ckp, cdata, client);
             goto out_true;
         }
-        sender_send->ofs += ret;
-        sender_send->len -= ret;
+        sender_send->ofs += (int)ret;
+        sender_send->len -= (int)ret;
         client->blocked_time = 0;
     }
 out_true:
@@ -798,21 +977,33 @@ out_true:
 
 static void clear_sender_send(sender_send_t *sender_send, cdata_t *cdata)
 {
-    dec_instance_ref(cdata, sender_send->client);
+    client_instance_t *client = sender_send->client;
+    csender_t *cs = &cdata->csenders[(uint64_t)client->id % (uint64_t)cdata->nsenders];
+
+    mutex_lock(&cs->lock);
+    client->queued_bytes -= sender_send->qlen;
+    if (unlikely(client->queued_bytes < 0))
+        client->queued_bytes = 0;
+    mutex_unlock(&cs->lock);
+
+    dec_instance_ref(cdata, client);
     free(sender_send->buf);
     free(sender_send);
 }
 
-/* Use a thread to send queued messages, appending them to the sends list and
- * iterating over all of them, attempting to send them all non-blocking to
- * only send to those clients ready to receive data. */
+/* Sharded sender thread: sleeps completely idle via pthread_cond_wait when no
+ * writes are EAGAIN-delayed (zero wasted 10ms wakeups), switching to a 10ms
+ * retry poll only while blocked sends remain in the local queue. */
 static void *sender(void *arg)
 {
-    cdata_t *cdata = (cdata_t *)arg;
+    csender_t *cs = (csender_t *)arg;
+    cdata_t *cdata = cs->cdata;
     sender_send_t *sends = NULL;
     pool_t *ckp = cdata->ckp;
+    char procname[16];
 
-    rename_proc("csender");
+    snprintf(procname, sizeof(procname), "csender%d", cs->id);
+    rename_proc(procname);
 
     while (42) {
         int64_t sends_queued = 0, sends_size = 0;
@@ -829,27 +1020,69 @@ static void *sender(void *arg)
             }
         }
 
-        mutex_lock(&cdata->sender_lock);
-        cdata->sends_delayed += sends_queued;
-        cdata->sends_queued = sends_queued;
-        cdata->sends_size = sends_size;
-        /* Poll every 10ms if there are no new sends. */
-        if (!cdata->sender_sends) {
-            const ts_t polltime = {0, 10000000};
-            ts_t timeout_ts;
+        mutex_lock(&cs->lock);
+        cs->sends_delayed += sends_queued;
+        cs->sends_queued = sends_queued;
+        cs->sends_size = sends_size;
+        if (!cs->sends) {
+            if (likely(!sends)) {
+                /* True event-driven sleep: pass underlying pthread_mutex_t */
+                cond_wait(&cs->cond, &cs->lock);
+            } else {
+                /* Retry EAGAIN-blocked sockets after 10ms */
+                const ts_t polltime = {0, 10000000};
+                ts_t timeout_ts;
 
-            ts_realtime(&timeout_ts);
-            timeraddspec(&timeout_ts, &polltime);
-            cond_timedwait(&cdata->sender_cond, &cdata->sender_lock, &timeout_ts);
+                ts_realtime(&timeout_ts);
+                timeraddspec(&timeout_ts, &polltime);
+                cond_timedwait(&cs->cond, &cs->lock, &timeout_ts);
+            }
         }
-        if (cdata->sender_sends) {
-            DL_CONCAT(sends, cdata->sender_sends);
-            cdata->sender_sends = NULL;
+        if (cs->sends) {
+            DL_CONCAT(sends, cs->sends);
+            cs->sends = NULL;
         }
-        mutex_unlock(&cdata->sender_lock);
+        mutex_unlock(&cs->lock);
     }
-    /* We shouldn't get here unless there's an error */
     return NULL;
+}
+
+static int64_t client_sendqueue_limit(const client_instance_t *client)
+{
+    int64_t limit;
+
+    if (client->remote || client->passthrough)
+        return REMOTE_SENDQUEUE_LIMIT;
+    limit = (int64_t)client->sendbufsize * 4;
+    if (limit < DEFAULT_SENDQUEUE_LIMIT)
+        limit = DEFAULT_SENDQUEUE_LIMIT;
+    return limit;
+}
+
+/* Append a pending send to the shard owning client->id and wake that shard.
+ * Never holds cs->lock while calling drop_client_by_id (strict lock hierarchy). */
+static void queue_sender_send(pool_t *ckp, cdata_t *cdata, client_instance_t *client,
+                              sender_send_t *sender_send)
+{
+    csender_t *cs = &cdata->csenders[(uint64_t)client->id % (uint64_t)cdata->nsenders];
+    int64_t queued;
+
+    sender_send->qlen = sender_send->len;
+
+    mutex_lock(&cs->lock);
+    cs->sends_generated++;
+    client->queued_bytes += sender_send->qlen;
+    queued = client->queued_bytes;
+    DL_APPEND(cs->sends, sender_send);
+    pthread_cond_signal(&cs->cond);
+    mutex_unlock(&cs->lock);
+
+    if (unlikely(queued > client_sendqueue_limit(client) && !client->invalid)) {
+        LOGNOTICE("Client id %"PRId64" fd %d %s exceeded send queue limit with %"PRId64
+                  " bytes queued, disconnecting", client->id, client->fd,
+                  client->address_name, queued);
+        drop_client_by_id(ckp, cdata, client->id);
+    }
 }
 
 static int add_redirect(pool_t *ckp, cdata_t *cdata, client_instance_t *client)
@@ -884,7 +1117,7 @@ static void redirect_client(pool_t *ckp, client_instance_t *client)
     char *buf;
     int num;
 
-    /* Set the redirected boool to only try redirecting them once */
+    /* Set the redirected bool to only try redirecting them once */
     client->redirected = true;
 
     num = add_redirect(ckp, cdata, client);
@@ -899,11 +1132,7 @@ static void redirect_client(pool_t *ckp, client_instance_t *client)
     sender_send->len = strlen(buf);
     inc_instance_ref(cdata, client);
 
-    mutex_lock(&cdata->sender_lock);
-    cdata->sends_generated++;
-    DL_APPEND(cdata->sender_sends, sender_send);
-    pthread_cond_signal(&cdata->sender_cond);
-    mutex_unlock(&cdata->sender_lock);
+    queue_sender_send(ckp, cdata, client, sender_send);
 }
 
 /* Look for accepted shares in redirector mode to know we can redirect this
@@ -916,7 +1145,6 @@ static bool test_redirector_shares(cdata_t *cdata, client_instance_t *client, co
     int64_t id;
 
     if (!val) {
-        /* Can happen when responding to invalid json from client */
         LOGINFO("Invalid json response to client %"PRId64 "%s", client->id, buf);
         return ret;
     }
@@ -955,7 +1183,6 @@ static bool test_redirector_shares(cdata_t *cdata, client_instance_t *client, co
                client->id);
         ret = true;
 
-        /* Clear the list now since we don't need it any more */
         ck_wlock(&cdata->lock);
         DL_FOREACH_SAFE(client->shares, share, found) {
             DL_DELETE(client->shares, share);
@@ -996,17 +1223,13 @@ static void send_client(pool_t *ckp, cdata_t *cdata, const int64_t id, char *buf
         return;
     }
 
-    /* Grab a reference to this client until the sender_send has
-     * completed processing. Is this a passthrough subclient ? */
     if ((pass_id = subclient(id))) {
         int64_t client_id = id & 0xffffffffll;
 
-        /* Make sure the passthrough exists for passthrough subclients */
         client = ref_client_by_id(cdata, pass_id);
         if (unlikely(!client)) {
             LOGINFO("Connector failed to find passthrough id %"PRId64" of client id %"PRId64" to send to",
                 pass_id, client_id);
-            /* Now see if the subclient exists */
             client = ref_client_by_id(cdata, client_id);
             if (client) {
                 invalidate_client(ckp, cdata, client);
@@ -1025,9 +1248,6 @@ static void send_client(pool_t *ckp, cdata_t *cdata, const int64_t id, char *buf
             return;
         }
         if (ckp->redirector && !client->redirected && client->authorized) {
-            /* If clients match the IP of clients that have already
-             * been whitelisted as finding valid shares then
-             * redirect them immediately. */
             if (redirect_matches(cdata, client))
                 redirect = true;
             else
@@ -1040,11 +1260,7 @@ static void send_client(pool_t *ckp, cdata_t *cdata, const int64_t id, char *buf
     sender_send->buf = buf;
     sender_send->len = len;
 
-    mutex_lock(&cdata->sender_lock);
-    cdata->sends_generated++;
-    DL_APPEND(cdata->sender_sends, sender_send);
-    pthread_cond_signal(&cdata->sender_cond);
-    mutex_unlock(&cdata->sender_lock);
+    queue_sender_send(ckp, cdata, client, sender_send);
 
     /* Redirect after sending response to shares and authorize */
     if (unlikely(redirect))
@@ -1133,7 +1349,6 @@ static bool connect_upstream(pool_t *ckp, connsock_t *cs)
     }
     keep_sockalive(cs->fd);
 
-    /* We want large send buffers for upstreaming messages */
     if (!ckp->rmem_warn)
         set_recvbufsize(ckp, cs->fd, 2097152);
     if (!ckp->wmem_warn)
@@ -1163,8 +1378,6 @@ static bool connect_upstream(pool_t *ckp, connsock_t *cs)
         LOGWARNING("Denied upstream trusted connection");
         goto out;
     }
-    /* Parse whether the upstream pool is using ckdb or not. Default to yes
-     * if no ckdb field is received for backward compatibility. */
     res_val = json_object_get(val, "ckdb");
     if (!res_val || json_is_true(res_val))
         ckp->upstream_ckdb = true;
@@ -1172,6 +1385,8 @@ static bool connect_upstream(pool_t *ckp, connsock_t *cs)
            ckp->upstream_ckdb ? "" : "non-", cs->url, cs->port);
     ret = true;
 out:
+    if (val)
+        json_decref(val);
     cksem_post(&cs->sem);
 
     return ret;
@@ -1253,7 +1468,7 @@ static void *urecv_process(void *arg)
         if (unlikely(!method)) {
             LOGWARNING("Failed to find method from upstream pool json %s",
                    cs->buf);
-            json_decref(val);
+            /* Single decref at label decref (fixes double-free bug) */
             goto decref;
         }
         if (!safecmp(method, stratum_msgs[SM_TRANSACTIONS]))
@@ -1316,6 +1531,9 @@ static void client_message_processor(pool_t *ckp, json_t *json_msg)
     client_instance_t *client;
     int64_t client_id;
 
+    if (unlikely(!json_msg))
+        return;
+
     /* Extract the client id from the json message and remove its entry */
     client_id = json_integer_value(json_object_get(json_msg, "client_id"));
     json_object_del(json_msg, "client_id");
@@ -1353,8 +1571,6 @@ static void drop_passthrough_client(pool_t *ckp, cdata_t *cdata, const int64_t i
 
     LOGINFO("Asked to drop passthrough client %"PRId64", forwarding to passthrough", id);
     client_id = id & 0xffffffffll;
-    /* We have a direct connection to the passthrough's connector so we
-     * can send it any regular commands. */
     ASPRINTF(&msg, "dropclient=%"PRId64"\n", client_id);
     send_client(ckp, cdata, id, msg);
 }
@@ -1369,7 +1585,6 @@ char *connector_stats(void *data, const int runtime)
     int64_t memsize, generated;
     char *buf;
 
-    /* If called in passthrough mode we log stats instead of the stratifier */
     if (runtime)
         json_set_int(val, "runtime", runtime);
 
@@ -1394,18 +1609,30 @@ char *connector_stats(void *data, const int runtime)
     objects = 0;
     memsize = 0;
 
-    mutex_lock(&cdata->sender_lock);
-    DL_FOREACH(cdata->sender_sends, send) {
-        objects++;
-        memsize += sizeof(sender_send_t) + send->len + 1;
+    {
+        int64_t sends_generated = 0, sends_queued = 0, sends_size = 0, sends_delayed = 0;
+        int i;
+
+        for (i = 0; i < cdata->nsenders; i++) {
+            csender_t *cs = &cdata->csenders[i];
+
+            mutex_lock(&cs->lock);
+            DL_FOREACH(cs->sends, send) {
+                objects++;
+                memsize += sizeof(sender_send_t) + send->len + 1;
+            }
+            sends_generated += cs->sends_generated;
+            sends_queued += cs->sends_queued;
+            sends_size += cs->sends_size;
+            sends_delayed += cs->sends_delayed;
+            mutex_unlock(&cs->lock);
+        }
+        JSON_CPACK(subval, "{si,sI,sI}", "count", objects, "memory", memsize, "generated", sends_generated);
+        json_steal_object(val, "sends", subval);
+
+        JSON_CPACK(subval, "{sI,sI,sI}", "count", sends_queued, "memory", sends_size, "generated", sends_delayed);
+        json_steal_object(val, "delays", subval);
     }
-    JSON_CPACK(subval, "{si,sI,sI}", "count", objects, "memory", memsize, "generated", cdata->sends_generated);
-    json_steal_object(val, "sends", subval);
-
-    JSON_CPACK(subval, "{sI,sI,sI}", "count", cdata->sends_queued, "memory", cdata->sends_size, "generated", cdata->sends_delayed);
-    mutex_unlock(&cdata->sender_lock);
-
-    json_steal_object(val, "delays", subval);
 
     buf = json_dumps(val, JSON_NO_UTF8 | JSON_PRESERVE_ORDER);
     json_decref(val);
@@ -1461,12 +1688,11 @@ retry:
 
     buf = umsg->buf;
     LOGDEBUG("Connector received message: %s", buf);
-    /* The bulk of the messages will be json messages to send to clients
-     * so look for them first. */
     if (likely(buf[0] == '{')) {
         json_t *val = json_loads(buf, JSON_DISABLE_EOF_CHECK, NULL);
 
-        ckmsgq_add(cdata->cmpq, val);
+        if (likely(val))
+            ckmsgq_add(cdata->cmpq, val);
     } else if (cmdmatch(buf, "dropclient")) {
         client_instance_t *client;
 
@@ -1475,7 +1701,6 @@ retry:
             LOGDEBUG("Connector failed to parse dropclient command: %s", buf);
             goto retry;
         }
-        /* A passthrough client */
         if (subclient(client_id)) {
             drop_passthrough_client(ckp, cdata, client_id);
             goto retry;
@@ -1516,6 +1741,7 @@ retry:
         LOGDEBUG("Connector received stats request");
         msg = connector_stats(cdata, 0);
         send_unix_msg(umsg->sockd, msg);
+        dealloc(msg);
     } else if (cmdmatch(buf, "loglevel")) {
         sscanf(buf, "loglevel=%d", &ckp->loglevel);
     } else if (cmdmatch(buf, "passthrough")) {
@@ -1574,8 +1800,6 @@ void *connector(void *arg)
     cdata->ckp = ckp;
 
     if (!ckp->serverurls) {
-        /* No serverurls have been specified. Bind to all interfaces
-         * on default sockets. */
         struct sockaddr_in serv_addr;
 
         cdata->serverfd = ckalloc(sizeof(int *));
@@ -1603,8 +1827,6 @@ void *connector(void *arg)
             Close(sockd);
             goto out;
         }
-        /* Set listen backlog to larger than SOMAXCONN in case the
-         * system configuration supports it */
         if (listen(sockd, 8192) < 0) {
             LOGERR("Connector failed to listen on socket");
             Close(sockd);
@@ -1658,7 +1880,7 @@ void *connector(void *arg)
     }
 
     if (tries)
-        LOGWARNING("Connector successfully bound to socket");
+        LOGWARNING("Connector successfully bound after retries");
 
     cdata->cmpq = create_ckmsgq(ckp, "cmpq", &client_message_processor);
 
@@ -1671,17 +1893,29 @@ void *connector(void *arg)
     /* Set the client id to the highest serverurl count to distinguish
      * them from the server fds in epoll/kqueue. */
     cdata->client_ids = ckp->serverurls;
-    mutex_init(&cdata->sender_lock);
-    cond_init(&cdata->sender_cond);
-    create_pthread(&cdata->pth_sender, sender, cdata);
+
     threads = sysconf(_SC_NPROCESSORS_ONLN) / 2;
     threads = threads > 0 ? threads : 1;
+
+    /* Spawn sharded sender threads (csender0..csenderN) for parallel socket writes */
+    cdata->nsenders = threads;
+    cdata->csenders = ckzalloc(sizeof(csender_t) * cdata->nsenders);
+    for (i = 0; i < cdata->nsenders; i++) {
+        csender_t *cs = &cdata->csenders[i];
+
+        cs->cdata = cdata;
+        cs->id = i;
+        mutex_init(&cs->lock);
+        cond_init(&cs->cond);
+        create_pthread(&cs->pth, sender, cs);
+    }
+
     cdata->cevents = create_ckmsgqs(ckp, "cevent", &client_event_processor, threads);
     create_pthread(&cdata->pth_receiver, receiver, cdata);
     cdata->start_time = time(NULL);
 
     ckp->connector_ready = true;
-    LOGWARNING("%s connector ready", ckp->name);
+    LOGWARNING("%s connector ready (%d sender shards)", ckp->name, cdata->nsenders);
 
     connector_loop(pi, cdata);
 out:
