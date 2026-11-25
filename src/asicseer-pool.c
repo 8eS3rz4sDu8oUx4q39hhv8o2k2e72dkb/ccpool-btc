@@ -42,10 +42,14 @@ pool_t *global_ckp;
 
 static bool open_logfile(pool_t *ckp)
 {
-    if (ckp->logfd > 0) {
+    if (ckp->logfp) {
         flock(ckp->logfd, LOCK_EX);
         fflush(ckp->logfp);
-        Close(ckp->logfd);
+        flock(ckp->logfd, LOCK_UN);
+        /* Close FILE* properly instead of raw fd to avoid leaking stdio buffers every minute */
+        fclose(ckp->logfp);
+        ckp->logfp = NULL;
+        ckp->logfd = -1;
     }
     ckp->logfp = fopen(ckp->logfilename, "ae");
     if (unlikely(!ckp->logfp)) {
@@ -83,9 +87,11 @@ static void proclog(pool_t *ckp, char *msg)
         open_logfile(ckp);
     }
 
-    flock(ckp->logfd, LOCK_EX);
-    fprintf(ckp->logfp, "%s", msg);
-    flock(ckp->logfd, LOCK_UN);
+    if (likely(ckp->logfp)) {
+        flock(ckp->logfd, LOCK_EX);
+        fprintf(ckp->logfp, "%s", msg);
+        flock(ckp->logfd, LOCK_UN);
+    }
 
     free(msg);
 }
@@ -156,43 +162,49 @@ out:
     free(buf);
 }
 
-/* Generic function for creating a message queue receiving and parsing thread */
+typedef struct {
+    ckmsgq_t *ckmsgq;
+    char name[16];
+} ckmsgq_worker_t;
+
+/* Generic worker thread pulling from a shared ckmsgq_t queue without 1s idle polling */
 static void *ckmsg_queue(void *arg)
 {
-    ckmsgq_t *ckmsgq = (ckmsgq_t *)arg;
+    ckmsgq_worker_t *worker = (ckmsgq_worker_t *)arg;
+    ckmsgq_t *ckmsgq = worker->ckmsgq;
     pool_t *ckp = ckmsgq->ckp;
 
     pthread_detach(pthread_self());
-    rename_proc(ckmsgq->name);
+    rename_proc(worker->name);
+    free(worker);
+
+    mutex_lock(ckmsgq->lock);
     ckmsgq->active = true;
+    mutex_unlock(ckmsgq->lock);
 
     while (42) {
         ckmsg_t *msg;
-        tv_t now;
-        ts_t abs;
 
         mutex_lock(ckmsgq->lock);
-        tv_time(&now);
-        tv_to_ts(&abs, &now);
-        abs.tv_sec++;
-        if (!ckmsgq->msgs)
-            cond_timedwait(ckmsgq->cond, ckmsgq->lock, &abs);
+        while (!ckmsgq->msgs)
+            cond_wait(ckmsgq->cond, ckmsgq->lock);
         msg = ckmsgq->msgs;
-        if (msg)
-            DL_DELETE(ckmsgq->msgs, msg);
+        DL_DELETE(ckmsgq->msgs, msg);
         mutex_unlock(ckmsgq->lock);
 
-        if (!msg)
-            continue;
         ckmsgq->func(ckp, msg->data);
         free(msg);
     }
     return NULL;
 }
 
-ckmsgq_t *create_ckmsgq(pool_t *ckp, const char *name, const void *func)
+/* Create a multi-worker message queue where all `count` threads share a single
+ * queue (enabling true multi-core parallelism without thundering herd wakeups). */
+ckmsgq_t *create_ckmsgqs(pool_t *ckp, const char *name, const void *func, const int count)
 {
+    const int nthreads = count > 0 ? count : 1;
     ckmsgq_t *ckmsgq = ckzalloc(sizeof(ckmsgq_t));
+    int i;
 
     strncpy(ckmsgq->name, name, 15);
     ckmsgq->func = func;
@@ -201,45 +213,36 @@ ckmsgq_t *create_ckmsgq(pool_t *ckp, const char *name, const void *func)
     ckmsgq->cond = ckalloc(sizeof(pthread_cond_t));
     mutex_init(ckmsgq->lock);
     cond_init(ckmsgq->cond);
-    create_pthread(&ckmsgq->pth, ckmsg_queue, ckmsgq);
 
-    return ckmsgq;
-}
+    for (i = 0; i < nthreads; i++) {
+        ckmsgq_worker_t *worker = ckzalloc(sizeof(*worker));
+        pthread_t pth;
 
-ckmsgq_t *create_ckmsgqs(pool_t *ckp, const char *name, const void *func, const int count)
-{
-    ckmsgq_t *ckmsgq = ckzalloc(sizeof(ckmsgq_t) * count);
-    mutex_t *lock;
-    pthread_cond_t *cond;
-    int i;
-
-    lock = ckalloc(sizeof(mutex_t));
-    cond = ckalloc(sizeof(pthread_cond_t));
-    mutex_init(lock);
-    cond_init(cond);
-
-    for (i = 0; i < count; i++) {
-        snprintf(ckmsgq[i].name, 15, "%.6s%x", name, i);
-        ckmsgq[i].func = func;
-        ckmsgq[i].ckp = ckp;
-        ckmsgq[i].lock = lock;
-        ckmsgq[i].cond = cond;
-        create_pthread(&ckmsgq[i].pth, ckmsg_queue, &ckmsgq[i]);
+        worker->ckmsgq = ckmsgq;
+        if (nthreads == 1)
+            strncpy(worker->name, name, sizeof(worker->name) - 1);
+        else
+            snprintf(worker->name, sizeof(worker->name), "%.6s%x", name, i);
+        create_pthread(&pth, ckmsg_queue, worker);
+        if (i == 0)
+            ckmsgq->pth = pth;
     }
 
     return ckmsgq;
 }
 
-/* Generic function for adding messages to a ckmsgq linked list and signal the
- * ckmsgq parsing thread(s) to wake up and process it. */
+ckmsgq_t *create_ckmsgq(pool_t *ckp, const char *name, const void *func)
+{
+    return create_ckmsgqs(ckp, name, func, 1);
+}
+
+/* Add a message to the shared ckmsgq and wake exactly one idle worker thread */
 bool ckmsgq_add_(ckmsgq_t *ckmsgq, void *data, const char *file, const char *func, const int line)
 {
     ckmsg_t *msg;
 
     if (unlikely(!ckmsgq)) {
         LOGWARNING("Sending messages to no queue from %s %s:%d", file, func, line);
-        /* Discard data if we're unlucky enough to be sending it to
-         * msg queues not set up during start up */
         free(data);
         return false;
     }
@@ -252,8 +255,8 @@ bool ckmsgq_add_(ckmsgq_t *ckmsgq, void *data, const char *file, const char *fun
     mutex_lock(ckmsgq->lock);
     ckmsgq->messages++;
     DL_APPEND(ckmsgq->msgs, msg);
-    /* Broadcast to ensure the assigned thread wakes up immediately */
-    pthread_cond_broadcast(ckmsgq->cond);
+    /* Single shared queue: wake one waiting worker thread (no thundering herd) */
+    pthread_cond_signal(ckmsgq->cond);
     mutex_unlock(ckmsgq->lock);
 
     return true;
@@ -268,13 +271,11 @@ bool ckmsgq_empty(ckmsgq_t *ckmsgq)
         goto out;
 
     mutex_lock(ckmsgq->lock);
-    if (ckmsgq->msgs)
-        ret = (ckmsgq->msgs->next == ckmsgq->msgs->prev);
+    ret = (ckmsgq->msgs == NULL);
     mutex_unlock(ckmsgq->lock);
 out:
     return ret;
 }
-
 /* Create a standalone thread that queues received unix messages for a proc
  * instance and adds them to linked list of received messages with their
  * associated receive socket, then signal the associated rmsg_cond for the
@@ -378,6 +379,12 @@ static int pid_wait(const pid_t pid, const int ms)
 
 static void api_message(pool_t *ckp, char **buf, int *sockd)
 {
+    if (unlikely(!ckp->ckpapi)) {
+        send_unix_msg(*sockd, "unsupported");
+        Close(*sockd);
+        dealloc(*buf);
+        return;
+    }
     apimsg_t *apimsg = ckalloc(sizeof(apimsg_t));
 
     apimsg->buf = *buf;
@@ -654,9 +661,6 @@ static int recv_available(pool_t *ckp, connsock_t *cs, size_t pagesize)
 }
 
 
-/* Like read_socket_line except it doesn't read lines. Designed to be used with
- * http response content. Read from a socket into cs->buf up to contentlen bytes.
- */
 int read_socket_contentlen(connsock_t *cs, int contentlen, float *timeout)
 {
     tv_t start, now;
@@ -666,8 +670,8 @@ int read_socket_contentlen(connsock_t *cs, int contentlen, float *timeout)
     float diff;
     int nread = 0;
 
-    if (unlikely(!cs)) {
-        LOGNOTICE("Invalidated connsock sent to %s", __func__);
+    if (unlikely(!cs || contentlen < 0)) {
+        LOGNOTICE("Invalidated connsock or negative contentlen sent to %s", __func__);
         return ret;
     }
 
@@ -675,7 +679,8 @@ int read_socket_contentlen(connsock_t *cs, int contentlen, float *timeout)
     quiet = ckp->proxy | ckp->remote;
 
     clear_bufline(cs);
-    ensure_buf_size(cs, contentlen, 0);
+    /* Always reserve +1 byte for NUL terminator to prevent heap overflow when contentlen % 4096 == 0 */
+    ensure_buf_size(cs, (size_t)contentlen + 1, 0);
     nread = cs->bufofs;
     tv_time(&start);
 
@@ -703,9 +708,6 @@ int read_socket_contentlen(connsock_t *cs, int contentlen, float *timeout)
         }
         ret = recv_available(ckp, cs, MIN(contentlen - nread, PAGESIZE * 4));
         if (ret < 1) {
-            /* If we have done wait_read_select there should be
-             * something to read and if we get nothing it means the
-             * socket is closed. */
             if (quiet)
                 LOGINFO("Failed to recv in %s", __func__);
             else
@@ -713,7 +715,6 @@ int read_socket_contentlen(connsock_t *cs, int contentlen, float *timeout)
             ret = -1;
             goto out;
         } else {
-            //LOGDEBUG("read: %d (%d)", ret, cs->fd);
             nread += ret;
         }
         tv_time(&now);
@@ -721,7 +722,11 @@ int read_socket_contentlen(connsock_t *cs, int contentlen, float *timeout)
         copy_tv(&start, &now);
         *timeout -= diff;
     }
-    if (nread && contentlen > 0) {
+    if (contentlen == 0) {
+        cs->buf[0] = '\0';
+        cs->buflen = cs->bufofs = 0;
+        ret = 0;
+    } else if (nread) {
         cs->buflen = cs->bufofs - contentlen - 1;
         if (cs->buflen > 0)
             cs->bufofs = nread + 1;
@@ -729,15 +734,14 @@ int read_socket_contentlen(connsock_t *cs, int contentlen, float *timeout)
             cs->buflen = 0;
             cs->bufofs = 0;
         }
-        cs->buf[contentlen] = '\0'; // is this redundant?
+        cs->buf[contentlen] = '\0';
         ret = contentlen;
-        //LOGDEBUG("%s: contentlen: %d nread: %d buflen: %d bufofs: %d bufsize: %d content: \"%s\"", __func__,
-        //         contentlen, nread, cs->buflen, cs->bufofs, cs->bufsize, cs->buf);
     }
 out:
     if (ret < 0) {
         empty_buffer(cs);
         dealloc(cs->buf);
+        cs->bufsize = 0;
     }
     return ret;
 }
@@ -894,7 +898,8 @@ static const char *rpc_method(const char *rpc_req)
 }
 
 /* All of these calls are made to bitcoind which prefers open/close instead
- * of persistent connections so cs->fd is always invalid. */
+ * of persistent connections so cs->fd is always invalid. Keep cs->buf warm
+ * (up to 16 MB) across calls to eliminate repeated multi-MB realloc/mmap churn. */
 static json_t *my_json_rpc_call(connsock_t *cs, const struct rpc_req_part *rpc_req, const bool info_only)
 {
     float timeout = RPC_TIMEOUT;
@@ -935,18 +940,18 @@ static json_t *my_json_rpc_call(connsock_t *cs, const struct rpc_req_part *rpc_r
         goto out;
     }
     const int len2 = strlen(cs->auth) + strlen(cs->url) + strlen(cs->port);
-    http_req = ckalloc(256 + len2); // Leave room for headers
+    http_req = ckalloc(300 + len2);
     len = 0;
-    for (cur = rpc_req; cur->string != NULL; cur++) {
-        //assert(strlen(cur->string) == cur->length);
+    for (cur = rpc_req; cur->string != NULL; cur++)
         len += cur->length;
-    }
+
     sprintf(http_req,
-         "POST / HTTP/1.1\n"
-         "Authorization: Basic %s\n"
-         "Host: %s:%s\n"
-         "Content-type: application/json\n"
-         "Content-Length: %d\n\n",
+         "POST / HTTP/1.1\r\n"
+         "Authorization: Basic %s\r\n"
+         "Host: %s:%s\r\n"
+         "Connection: close\r\n"
+         "Content-Type: application/json\r\n"
+         "Content-Length: %d\r\n\r\n",
          cs->auth, cs->url, cs->port, len);
 
     len = strlen(http_req);
@@ -964,7 +969,7 @@ static json_t *my_json_rpc_call(connsock_t *cs, const struct rpc_req_part *rpc_r
     tv_time(&stt_tv);
     for (cur = rpc_req; cur->string != NULL; cur++) {
         ret = write_socket(cs->fd, cur->string, cur->length);
-        if (ret != cur->length) {
+        if (ret != (int)cur->length) {
             tv_time(&fin_tv);
             elapsed = tvdiff(&fin_tv, &stt_tv);
             ASPRINTF(&warning, "Failed to write to socket in %s (%.20s...) %.3fs",
@@ -981,65 +986,62 @@ static json_t *my_json_rpc_call(connsock_t *cs, const struct rpc_req_part *rpc_r
              __func__, rpc_method(rpc_req[0].string), elapsed);
         goto out_empty;
     }
-    if (strncasecmp(cs->buf, "HTTP/1.1 200 OK", 15)) {
+    if (strncasecmp(cs->buf, "HTTP/1.1 200 OK", 15) && strncasecmp(cs->buf, "HTTP/1.0 200 OK", 15)) {
         tv_time(&fin_tv);
         elapsed = tvdiff(&fin_tv, &stt_tv);
         ASPRINTF(&warning, "HTTP response to (%.20s...) %.3fs not ok: %s",
              rpc_method(rpc_req[0].string), elapsed, cs->buf);
         timeout = 0;
-        /* Look for a json response if there is one */
         while (read_socket_line(cs, &timeout) > 0) {
             timeout = 0;
             if (*cs->buf != '{')
                 continue;
             free(warning);
-            /* Replace the warning with the json response */
             ASPRINTF(&warning, "JSON response to (%.20s...) %.3fs not ok: %s",
                  rpc_method(rpc_req[0].string), elapsed, cs->buf);
             break;
         }
         goto out_empty;
     }
+
+    /* Read all HTTP response headers in any order until the blank line */
     int contentlen = -1;
-    while (contentlen < 0) {
+    while (42) {
         ret = read_socket_line(cs, &timeout);
-        if (ret < 1) {
+        if (ret < 0 || (ret == 0 && timeout < 0)) {
             tv_time(&fin_tv);
             elapsed = tvdiff(&fin_tv, &stt_tv);
             ASPRINTF(&warning, "Failed to read http socket lines in %s (%.20s...) %.3fs",
                  __func__, rpc_method(rpc_req[0].string), elapsed);
             goto out_empty;
         }
+        if (ret == 0 || (ret == 1 && cs->buf[0] == '\r'))
+            break;
         if (0 == strncasecmp("Content-Length: ", cs->buf, 16)) {
-            // parse content-length: header line
             if (1 != sscanf(cs->buf + 16, "%d", &contentlen) || contentlen < 0) {
-                // parse error
                 tv_time(&fin_tv);
                 elapsed = tvdiff(&fin_tv, &stt_tv);
                 ASPRINTF(&warning, "Failed to read content-length lines in %s (%.20s...) %.3fs",
                          __func__, rpc_method(rpc_req[0].string), elapsed);
                 goto out_empty;
             }
-            // read blank line
-            if ((ret = read_socket_line(cs, &timeout)) != 1) {
-                tv_time(&fin_tv);
-                elapsed = tvdiff(&fin_tv, &stt_tv);
-                ASPRINTF(&warning, "Failed to read a blank line after content-length: %d in %s (%.20s...) %.3fs, got ret: %d",
-                         contentlen, __func__, rpc_method(rpc_req[0].string), elapsed, ret);
-                ret = -1;
-                goto out_empty;
-            }
-            // at this point we parsed the content length and we break out of this loop
         }
     }
-    // read exactly contentlen bytes
+    if (unlikely(contentlen < 0)) {
+        tv_time(&fin_tv);
+        elapsed = tvdiff(&fin_tv, &stt_tv);
+        ASPRINTF(&warning, "Missing Content-Length header in %s (%.20s...) %.3fs",
+             __func__, rpc_method(rpc_req[0].string), elapsed);
+        goto out_empty;
+    }
+
+    /* Read exactly contentlen bytes */
     ret = read_socket_contentlen(cs, contentlen, &timeout);
     if (ret != contentlen) {
         tv_time(&fin_tv);
         elapsed = tvdiff(&fin_tv, &stt_tv);
         ASPRINTF(&warning, "Failed to read content of length %d (got %d) in %s (%.20s...) %.3fs",
                  contentlen, ret, __func__, rpc_method(rpc_req[0].string), elapsed);
-        ret = -1;
         goto out_empty;
     }
     tv_time(&fin_tv);
@@ -1049,13 +1051,12 @@ static json_t *my_json_rpc_call(connsock_t *cs, const struct rpc_req_part *rpc_r
                  elapsed, __func__, rpc_method(rpc_req[0].string));
     }
     {
-        // parse json, if it takes longer than 0.1 seconds to parse, print to debug log
         const int64_t t0 = time_micros();
         val = json_loads(cs->buf, 0, &err_val);
-        const double elapsed = (time_micros() - t0) / 1e6;
-        if (elapsed >= 0.1)
+        const double parse_elapsed = (time_micros() - t0) / 1e6;
+        if (parse_elapsed >= 0.1)
             LOGDEBUG("%s: json_loads (%.20s...) took %1.6f secs", __func__,
-                     rpc_method(rpc_req[0].string), elapsed);
+                     rpc_method(rpc_req[0].string), parse_elapsed);
     }
     if (!val) {
         ASPRINTF(&warning, "JSON decode (%.20s...) failed(%d): %s",
@@ -1074,7 +1075,11 @@ out:
     }
     Close(cs->fd);
     free(http_req);
-    dealloc(cs->buf);
+    /* Keep cs->buf warm across calls up to 16 MB; shrink only after oversized blocks */
+    if (cs->buf && cs->bufsize > 16 * 1024 * 1024) {
+        dealloc(cs->buf);
+        cs->bufsize = 0;
+    }
     cksem_post(&cs->sem);
     return val;
 }
@@ -1275,20 +1280,19 @@ static void launch_logger(pool_t *ckp)
 {
     ckp->logger = create_ckmsgq(ckp, "logger", &proclog);
     ckp->console_logger = create_ckmsgq(ckp, "conlog", &console_log);
-    // spin waiting for a time for loggers to be alive before proceeding.
     for (int backoff = 1; !ckp->logger->active && !ckp->console_logger->active; backoff <<= 1) {
         if (backoff >= 16384)
             quit(1, "Timed out waiting for logger threads to start, exiting!");
         cksleep_ms(backoff);
     }
     if (ckp->daemon) {
-        // daemon mode -- we have no need for stdout/stderr/stdin anymore since we have
-        // successfully launched the loggers.  Replace these fd's to be safe.
-        int fd = open("/dev/null",O_RDWR, 0);
+        int fd = open("/dev/null", O_RDWR, 0);
         if (fd != -1) {
             dup2(fd, STDIN_FILENO);
             dup2(fd, STDOUT_FILENO);
             dup2(fd, STDERR_FILENO);
+            if (fd > 2)
+                close(fd);
         }
     }
 }
@@ -1497,7 +1501,7 @@ static void parse_btcds(pool_t *ckp, const json_t *arr_val, const int arr_size)
     ckp->btcdurl = ckzalloc(sizeof(char *) * arr_size);
     ckp->btcdauth = ckzalloc(sizeof(char *) * arr_size);
     ckp->btcdpass = ckzalloc(sizeof(char *) * arr_size);
-    ckp->btcdnotify = ckzalloc(sizeof(bool *) * arr_size);
+    ckp->btcdnotify = ckzalloc(sizeof(bool) * arr_size);
     ckp->btcdzmqblock = ckzalloc(sizeof(char *) * arr_size);
     for (i = 0; i < arr_size; i++) {
         val = json_array_get(arr_val, i);
@@ -1506,7 +1510,6 @@ static void parse_btcds(pool_t *ckp, const json_t *arr_val, const int arr_size)
         json_get_string(&ckp->btcdpass[i], val, "pass");
         json_get_bool(&ckp->btcdnotify[i], val, "notify");
         char *zmq = NULL;
-        // "zmq", "zmqblock", or "zmqpubhashblock" are equivalent
         if (json_get_string(&zmq, val, "zmq")
                 || json_get_string(&zmq, val, "zmqblock")
                 || json_get_string(&zmq, val, "zmqpubhashblock")) {
@@ -1595,15 +1598,16 @@ static void parse_nodeservers(pool_t *ckp, const json_t *arr_val)
         return;
     }
     total_urls = ckp->serverurls + arr_size;
-    ckp->serverurl = realloc(ckp->serverurl, sizeof(char *) * total_urls);
-    ckp->nodeserver = realloc(ckp->nodeserver, sizeof(bool) * total_urls);
-    ckp->trusted = realloc(ckp->trusted, sizeof(bool) * total_urls);
+    ckp->serverurl = ckrealloc(ckp->serverurl, sizeof(char *) * total_urls);
+    ckp->nodeserver = ckrealloc(ckp->nodeserver, sizeof(bool) * total_urls);
+    ckp->trusted = ckrealloc(ckp->trusted, sizeof(bool) * total_urls);
     for (i = 0, j = ckp->serverurls; j < total_urls; i++, j++) {
         json_t *val = json_array_get(arr_val, i);
 
         if (!my_json_get_string(&ckp->serverurl[j], val, "nodeserver"))
             LOGWARNING("Invalid nodeserver entry number %d", i);
         ckp->nodeserver[j] = true;
+        ckp->trusted[j] = false;
         ckp->nodeservers++;
     }
     ckp->serverurls = total_urls;
@@ -1625,14 +1629,15 @@ static void parse_trusted(pool_t *ckp, const json_t *arr_val)
         return;
     }
     total_urls = ckp->serverurls + arr_size;
-    ckp->serverurl = realloc(ckp->serverurl, sizeof(char *) * total_urls);
-    ckp->nodeserver = realloc(ckp->nodeserver, sizeof(bool) * total_urls);
-    ckp->trusted = realloc(ckp->trusted, sizeof(bool) * total_urls);
+    ckp->serverurl = ckrealloc(ckp->serverurl, sizeof(char *) * total_urls);
+    ckp->nodeserver = ckrealloc(ckp->nodeserver, sizeof(bool) * total_urls);
+    ckp->trusted = ckrealloc(ckp->trusted, sizeof(bool) * total_urls);
     for (i = 0, j = ckp->serverurls; j < total_urls; i++, j++) {
         json_t *val = json_array_get(arr_val, i);
 
         if (!my_json_get_string(&ckp->serverurl[j], val, "trusted"))
             LOGWARNING("Invalid trusted server entry number %d", i);
+        ckp->nodeserver[j] = false;
         ckp->trusted[j] = true;
     }
     ckp->serverurls = total_urls;
@@ -1836,10 +1841,11 @@ static void parse_config(pool_t *ckp)
     json_get_int(&ckp->nonce2length, json_conf, "nonce2length");
     json_get_int(&ckp->update_interval, json_conf, "update_interval");
     json_get_string(&vmask, json_conf, "version_mask");
-    if (vmask && strlen(vmask) && validhex(vmask))
+   if (vmask && strlen(vmask) && validhex(vmask))
         sscanf(vmask, "%x", &ckp->version_mask);
     else
         ckp->version_mask = 0x1fffe000;
+    free(vmask);
     /* Look for an array first and then a single entry */
     arr_val = json_object_get(json_conf, "serverurl");
     if (!parse_serverurls(ckp, arr_val)) {
@@ -2319,7 +2325,7 @@ int main(int argc, char **argv)
     /* Create the logfile */
     ASPRINTF(&ckp.logfilename, "%s%s.log", ckp.logdir, ckp.name);
     if (!open_logfile(&ckp))
-        quit(1, "Failed to make open log file %s", buf);
+        quit(1, "Failed to make open log file %s", ckp.logfilename);
     launch_logger(&ckp); // note that at this point, if ckp.daemon is true, stdout, stderr, and stdin are all closed here.
 
     LOGNOTICE("%s", banner_string()); // print banner to log so users know what version was running
@@ -2336,7 +2342,7 @@ int main(int argc, char **argv)
     ckp.main.processname = strdup("main");
     ckp.main.sockname = strdup("listener");
     name_process_sockname(&ckp.main.us, &ckp.main);
-    ckp.oldconnfd = ckzalloc(sizeof(int *) * ckp.serverurls);
+    ckp.oldconnfd = ckzalloc(sizeof(int) * ckp.serverurls);
     manage_old_instance(&ckp, &ckp.main);
     if (ckp.handover) {
         const char *path = ckp.main.us.path;
