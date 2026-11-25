@@ -1179,12 +1179,13 @@ int get_fd_(int sockd, const char *file, const char *func, const int line)
     struct iovec iov[1];
     struct msghdr msg;
     struct cmsghdr *cmptr = ckzalloc(CONTROLLLEN);
-    int *cm;
+    struct cmsghdr *cmsg;
 
     memset(&msg, 0, sizeof(struct msghdr));
     iov[0].iov_base = buf;
     iov[0].iov_len = sizeof(buf);
     msg.msg_iov = iov;
+    msg.msg_iovlen = 1;
     msg.msg_name = NULL;
     msg.msg_namelen = 0;
     msg.msg_control = cmptr;
@@ -1193,9 +1194,10 @@ int get_fd_(int sockd, const char *file, const char *func, const int line)
         LOGERR("Failed to recv_unix_data in get_fd from %s %s:%d", file, func, line);
         goto out;
     }
+    cmsg = CMSG_FIRSTHDR(&msg);
+    if (likely(cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS))
+        memcpy(&newfd, CMSG_DATA(cmsg), sizeof(newfd));
 out:
-    cm = (int *)CMSG_DATA(cmptr);
-    newfd = *cm;
     free(cmptr);
     return newfd;
 }
@@ -1222,7 +1224,7 @@ const char *json_array_string__(json_t *val, unsigned int entry)
         return NULL;
     if (!json_is_array(val))
         return NULL;
-    if (entry > json_array_size(val))
+    if (entry >= json_array_size(val))
         return NULL;
     arr_entry = json_array_get(val, entry);
     if (!json_is_string(arr_entry))
@@ -1781,15 +1783,15 @@ int write_compact_size(void *dest, size_t nSize)
     return 9;
 }
 
-/* For testing a le encoded 256 byte hash against a target */
+/* For testing a le encoded 256-bit (32-byte) hash against a target */
 bool fulltest(const uchar *hash, const uchar *target)
 {
     bool ret = true;
     int i;
 
     for (i = 28; i >= 0; i -= 4) {
-        const uint32_t h32tmp = le32toh(read_i32(hash + i*4));
-        const uint32_t t32tmp = le32toh(read_i32(target + i*4));
+        const uint32_t h32tmp = le32toh(read_i32(hash + i));
+        const uint32_t t32tmp = le32toh(read_i32(target + i));
 
         if (h32tmp > t32tmp) {
             ret = false;
@@ -2102,7 +2104,8 @@ double diff_from_nbits(const uchar *nbits)
         powdiff = 0;
     memcpy(&diff32, nbits, sizeof(diff32));
     diff32 = be32toh(diff32) & 0x00FFFFFFu;
-    numerator = 0xFFFFULL << powdiff;
+    /* Use ldexp() instead of 64-bit integer shift so difficulty > ~281T (nBits <= 0x16) never overflows */
+    numerator = ldexp(65535.0, powdiff);
     if (unlikely(diff32 == 0))
         // this should never happen, but prevent floating point exceptions
         diff32 = 1;
